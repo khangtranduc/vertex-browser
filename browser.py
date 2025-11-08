@@ -2,7 +2,7 @@ import sys
 import os
 import json
 from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer
-from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush
+from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -30,14 +30,14 @@ class GraphView(QWidget):
         self.setMouseTracking(True)
         # Physics parameters
         self.physics_enabled = True
-        self.physics_interval_ms = 50  # 20 FPS
+        self.physics_interval_ms = 33  # ~30 FPS for smoother animation
         self.attraction_threshold = 0.15
-        self.attraction_strength = 0.8
-        self.repulsion_strength = 2000.0
+        self.attraction_strength = 0.5  # Gentler attraction
+        self.repulsion_strength = 1500.0  # Less aggressive repulsion
         # Separation to keep comfortable distances (pixels)
-        self.min_separation = 80.0
-        self.separation_strength = 8.0
-        self.damping = 0.85
+        self.min_separation = 100.0  # More breathing room
+        self.separation_strength = 6.0
+        self.damping = 0.90  # Higher damping for smoother settling
 
         # Start physics timer
         self._physics_timer = QTimer(self)
@@ -47,14 +47,27 @@ class GraphView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        # Draw Obsidian-inspired dark background
+        bg_color = QColor(30, 30, 35)  # Dark gray-blue
+        painter.fillRect(self.rect(), bg_color)
+
+        # Draw subtle grid pattern
+        painter.setPen(QPen(QColor(50, 50, 60, 40), 1))
+        grid_size = 50
+        for x in range(0, self.width(), grid_size):
+            painter.drawLine(x, 0, x, self.height())
+        for y in range(0, self.height(), grid_size):
+            painter.drawLine(0, y, self.width(), y)
+
         # Get all non-graph tabs
         tabs = self.browser.get_web_tabs()
-        
+
         if not tabs:
-            painter.setPen(QPen(Qt.black))
-            painter.setFont(QFont('Arial', 12))
-            painter.drawText(self.rect(), Qt.AlignCenter, 
+            painter.setPen(QPen(QColor(150, 150, 160)))
+            painter.setFont(QFont('Arial', 14))
+            painter.drawText(self.rect(), Qt.AlignCenter,
                            "No tabs to display\nOpen some web pages to see the graph")
             return
         
@@ -90,43 +103,63 @@ class GraphView(QWidget):
         # Draw nodes
         for idx, (x, y) in self.node_positions.items():
             tab_data = tabs[idx]
-            
+
             # Node appearance based on state
             if idx == self.hovered_node:
-                node_color = QColor(100, 180, 255)  # Light blue for hover
-                border_color = QColor(70, 130, 200)
-                radius = 33
+                radius = 35
+                # Gradient from purple to blue (hovered)
+                gradient = QRadialGradient(x, y, radius)
+                gradient.setColorAt(0, QColor(160, 100, 255))
+                gradient.setColorAt(0.7, QColor(120, 80, 220))
+                gradient.setColorAt(1, QColor(90, 60, 180))
+                node_brush = QBrush(gradient)
+                border_color = QColor(180, 120, 255)
+                border_width = 2.5
             else:
-                node_color = QColor(70, 130, 180)  # Default blue
-                border_color = QColor(50, 80, 130)
-                radius = 30
-            
-            # Node circle with shadow
-            painter.setBrush(QBrush(QColor(0, 0, 0, 50)))
+                radius = 32
+                # Gradient from lighter to darker purple (normal)
+                gradient = QRadialGradient(x, y, radius)
+                gradient.setColorAt(0, QColor(110, 80, 160))
+                gradient.setColorAt(0.7, QColor(85, 65, 130))
+                gradient.setColorAt(1, QColor(65, 50, 100))
+                node_brush = QBrush(gradient)
+                border_color = QColor(100, 75, 150, 180)
+                border_width = 2
+
+            # Soft outer glow
+            glow_radius = radius + 8
+            glow = QRadialGradient(x, y, glow_radius)
+            glow.setColorAt(0, QColor(120, 90, 180, 60))
+            glow.setColorAt(0.5, QColor(80, 60, 120, 30))
+            glow.setColorAt(1, QColor(0, 0, 0, 0))
+            painter.setBrush(QBrush(glow))
             painter.setPen(QPen(Qt.NoPen))
-            painter.drawEllipse(QPointF(x + 2, y + 2), radius, radius)
-            
+            painter.drawEllipse(QPointF(x, y), glow_radius, glow_radius)
+
+            # Shadow
+            painter.setBrush(QBrush(QColor(0, 0, 0, 80)))
+            painter.drawEllipse(QPointF(x + 3, y + 3), radius, radius)
+
             # Node circle
-            painter.setBrush(QBrush(node_color))
-            painter.setPen(QPen(border_color, 3))
+            painter.setBrush(node_brush)
+            painter.setPen(QPen(border_color, border_width))
             painter.drawEllipse(QPointF(x, y), radius, radius)
-            
+
             # Tab title
-            painter.setPen(QPen(Qt.black))
-            painter.setFont(QFont('Arial', 10, QFont.Bold))
-            title = tab_data['title'][:20] + '...' if len(tab_data['title']) > 20 else tab_data['title']
-            
+            painter.setFont(QFont('Segoe UI', 10, QFont.Normal))
+            title = tab_data['title'][:25] + '...' if len(tab_data['title']) > 25 else tab_data['title']
+
             # Draw title below node
-            text_rect = painter.boundingRect(0, 0, 200, 50, Qt.AlignCenter, title)
-            text_rect.moveCenter(QPointF(x, y + radius + 25).toPoint())
-            
-            # Background for text
-            painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
-            painter.setPen(QPen(Qt.NoPen))
-            painter.drawRect(text_rect.adjusted(-5, -2, 5, 2))
-            
-            # Text
-            painter.setPen(QPen(Qt.black))
+            text_rect = painter.boundingRect(0, 0, 250, 50, Qt.AlignCenter, title)
+            text_rect.moveCenter(QPointF(x, y + radius + 20).toPoint())
+
+            # Dark semi-transparent background for text
+            painter.setBrush(QBrush(QColor(25, 25, 30, 200)))
+            painter.setPen(QPen(QColor(80, 70, 120, 100), 1))
+            painter.drawRoundedRect(text_rect.adjusted(-8, -3, 8, 3), 5, 5)
+
+            # Text with light purple color
+            painter.setPen(QPen(QColor(220, 200, 255)))
             painter.drawText(text_rect, Qt.AlignCenter, title)
         
         # Restore painter state
@@ -173,32 +206,57 @@ class GraphView(QWidget):
                     # Weight derived from similarity (0..1)
                     weight = float(similarity)
 
-                    # Map weight to a visible thickness range
-                    # (min_width..max_width) so stronger similarities
-                    # produce thicker lines.
-                    min_width = 1
-                    max_width = 12
-                    thickness = int(min_width + (max_width - min_width) * weight)
-                    thickness = max(min_width, min(max_width, thickness))
+                    # Smoother thickness scaling - less variation
+                    min_width = 1.5
+                    max_width = 4
+                    thickness = min_width + (max_width - min_width) * weight
 
-                    # Alpha still derived from similarity for translucency
-                    alpha = max(30, min(255, int(50 + weight * 200)))
+                    # More subtle alpha for less clutter
+                    alpha = int(80 + weight * 120)  # 80-200 range
 
-                    # Highlight edge if either node is hovered
+                    # Obsidian-inspired purple/blue gradient colors
                     if self.hovered_node in (idx1, idx2):
-                        pen = QPen(QColor(100, 150, 255, alpha), thickness + 1)
+                        # Bright purple when hovered
+                        color = QColor(150, 100, 255, alpha)
                     else:
-                        pen = QPen(QColor(100, 100, 200, alpha), thickness)
+                        # Muted purple-blue for normal edges
+                        color = QColor(120, 90, 180, alpha)
 
-                    painter.setPen(pen)
-                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+                    # Create curved path instead of straight line
+                    path = QPainterPath()
+                    path.moveTo(x1, y1)
 
-                    # Draw similarity score at midpoint
+                    # Calculate control point for bezier curve
+                    # Offset perpendicular to the line for a gentle curve
                     mid_x = (x1 + x2) / 2
                     mid_y = (y1 + y2) / 2
-                    painter.setFont(QFont('Arial', 8))
-                    painter.setPen(QPen(QColor(100, 100, 200)))
-                    painter.drawText(int(mid_x), int(mid_y), f"{similarity:.2f}")
+                    dx = x2 - x1
+                    dy = y2 - y1
+                    dist = math.sqrt(dx*dx + dy*dy)
+
+                    # Curve amount based on distance (less curve for short distances)
+                    curve_amount = min(50, dist * 0.15)
+
+                    # Perpendicular offset
+                    if dist > 0:
+                        ctrl_x = mid_x - dy / dist * curve_amount
+                        ctrl_y = mid_y + dx / dist * curve_amount
+                    else:
+                        ctrl_x = mid_x
+                        ctrl_y = mid_y
+
+                    # Draw smooth quadratic bezier curve
+                    path.quadTo(ctrl_x, ctrl_y, x2, y2)
+
+                    pen = QPen(color, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                    painter.setPen(pen)
+                    painter.drawPath(path)
+
+                    # Only show similarity score on hover
+                    if self.hovered_node in (idx1, idx2):
+                        painter.setFont(QFont('Arial', 9, QFont.Bold))
+                        painter.setPen(QPen(QColor(200, 180, 255)))
+                        painter.drawText(int(mid_x), int(mid_y - 5), f"{similarity:.2f}")
 
     def _physics_tick(self):
         """Timer tick: apply a small physics step and request repaint."""

@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 import math
+import random
 
 class GraphView(QWidget):
     """Widget that displays a graph visualization of browser tabs"""
@@ -149,9 +150,19 @@ class GraphView(QWidget):
                     x1, y1 = self.node_positions[idx1]
                     x2, y2 = self.node_positions[idx2]
 
-                    # Line thickness and alpha based on similarity
-                    thickness = max(1, int(1 + similarity * 5))
-                    alpha = max(30, min(255, int(50 + similarity * 200)))
+                    # Weight derived from similarity (0..1)
+                    weight = float(similarity)
+
+                    # Map weight to a visible thickness range
+                    # (min_width..max_width) so stronger similarities
+                    # produce thicker lines.
+                    min_width = 1
+                    max_width = 12
+                    thickness = int(min_width + (max_width - min_width) * weight)
+                    thickness = max(min_width, min(max_width, thickness))
+
+                    # Alpha still derived from similarity for translucency
+                    alpha = max(30, min(255, int(50 + weight * 200)))
 
                     # Highlight edge if either node is hovered
                     if self.hovered_node in (idx1, idx2):
@@ -345,7 +356,7 @@ class Browser(QMainWindow):
         
         # Create graph view tab first
         self.graph_view = GraphView(self)
-        self.graph_tab_index = self.tabs.addTab(self.graph_view, '📊 Graph View')
+        self.graph_tab_index = self.tabs.addTab(self.graph_view, 'Graph View')
         
         # Connect tab changed signal after graph_tab_index is set
         self.tabs.currentChanged.connect(self.on_tab_changed)
@@ -421,34 +432,37 @@ class Browser(QMainWindow):
         - Topic modeling
         - User browsing patterns
         """
+
+        return random.random();
+
         # Simple domain-based similarity
-        try:
-            domain1 = QUrl(url1).host()
-            domain2 = QUrl(url2).host()
+        # try:
+        #     domain1 = QUrl(url1).host()
+        #     domain2 = QUrl(url2).host()
             
-            # Same domain = high similarity
-            if domain1 == domain2:
-                return 0.9
+        #     # Same domain = high similarity
+        #     if domain1 == domain2:
+        #         return 0.9
             
-            # Same top-level domain = medium similarity
-            tld1 = '.'.join(domain1.split('.')[-2:]) if '.' in domain1 else domain1
-            tld2 = '.'.join(domain2.split('.')[-2:]) if '.' in domain2 else domain2
+        #     # Same top-level domain = medium similarity
+        #     tld1 = '.'.join(domain1.split('.')[-2:]) if '.' in domain1 else domain1
+        #     tld2 = '.'.join(domain2.split('.')[-2:]) if '.' in domain2 else domain2
             
-            if tld1 == tld2:
-                return 0.5
+        #     if tld1 == tld2:
+        #         return 0.5
             
-            # Check for common keywords
-            keywords1 = set(domain1.lower().split('.'))
-            keywords2 = set(domain2.lower().split('.'))
-            common = keywords1.intersection(keywords2)
+        #     # Check for common keywords
+        #     keywords1 = set(domain1.lower().split('.'))
+        #     keywords2 = set(domain2.lower().split('.'))
+        #     common = keywords1.intersection(keywords2)
             
-            if common:
-                return 0.4
+        #     if common:
+        #         return 0.4
             
-            return 0.1  # Low default similarity
+        #     return 0.1  # Low default similarity
             
-        except:
-            return 0.0
+        # except:
+        #     return 0.0
     
     def update_graph(self):
         """Update the graph view"""

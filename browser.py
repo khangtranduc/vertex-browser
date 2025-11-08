@@ -144,7 +144,7 @@ class GraphView(QWidget):
                 return idx
         return None
 
-    def draw_edges(self, painter, tabs, tab_indices, threshold=0.3):
+    def draw_edges(self, painter, tabs, tab_indices, threshold=0.20):
         """Draw edges between nodes when similarity exceeds threshold.
 
         painter: QPainter already transformed for pan/zoom
@@ -161,7 +161,8 @@ class GraphView(QWidget):
                     similarity = self.browser.calculate_similarity(
                         tabs[idx1]['url'], tabs[idx2]['url']
                     )
-                except Exception:
+                except Exception as e:
+                    print(f"[DEBUG] Error calculating similarity: {e}")
                     similarity = 0.0
 
                 # Draw edge if similarity exceeds threshold
@@ -510,16 +511,20 @@ class BrowserTab(QWidget):
         def handle_content(result):
             if result:
                 self.page_content = result
+                print(f"✓ Extracted content from {self.web_view.url().toString()[:60]}")
+            else:
+                self.page_content = ""
             self.content_extraction_pending = False
             # Trigger graph update after content is extracted
-            if hasattr(self.parent(), 'update_graph'):
-                self.parent().update_graph()
+            if hasattr(self, 'browser_parent') and self.browser_parent:
+                self.browser_parent.update_graph()
 
         self.web_view.page().runJavaScript(js_code, handle_content)
 
-    def on_load_finished(self):
+    def on_load_finished(self, success):
         # Extract page content when page loads
-        self.extract_page_content()
+        if success:
+            self.extract_page_content()
 
 
 class Browser(QMainWindow):
@@ -545,10 +550,22 @@ class Browser(QMainWindow):
         # Connect tab changed signal after graph_tab_index is set
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
-        # Add new tab button
+        # Add new tab button and refresh button
+        corner_widget = QWidget()
+        corner_layout = QHBoxLayout()
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+
+        refresh_btn = QPushButton('⟳ Extract Content')
+        refresh_btn.clicked.connect(self.refresh_all_content)
+        refresh_btn.setToolTip('Re-extract content from all tabs')
+
         new_tab_btn = QPushButton('+')
         new_tab_btn.clicked.connect(self.add_new_tab)
-        self.tabs.setCornerWidget(new_tab_btn)
+
+        corner_layout.addWidget(refresh_btn)
+        corner_layout.addWidget(new_tab_btn)
+        corner_widget.setLayout(corner_layout)
+        self.tabs.setCornerWidget(corner_widget)
 
         self.setCentralWidget(self.tabs)
 
@@ -573,23 +590,24 @@ class Browser(QMainWindow):
     def add_new_tab(self, url='https://www.google.com'):
         """Add a new browser tab"""
         browser_tab = BrowserTab()
-        browser_tab.parent = lambda: self  # Allow tab to access browser
-        
+        browser_tab.browser_parent = self  # Store reference to browser
+        browser_tab.tab_id = id(browser_tab)  # Unique ID for debugging
+
         idx = self.tabs.addTab(browser_tab, 'New Tab')
         self.tabs.setCurrentIndex(idx)
-        
+
         # Load URL - handle both string URLs and boolean from button clicks
         if isinstance(url, bool):
             url = 'https://www.google.com'
         elif not url.startswith('http'):
             url = 'https://' + url
         browser_tab.web_view.setUrl(QUrl(url))
-        
+
         # Update tab title when page loads
         browser_tab.web_view.titleChanged.connect(
             lambda title, i=idx: self.update_tab_title(i, title)
         )
-        
+
         return browser_tab
     
     def close_tab(self, idx):
@@ -604,6 +622,15 @@ class Browser(QMainWindow):
             short_title = title[:20] + '...' if len(title) > 20 else title
             self.tabs.setTabText(idx, short_title)
             self.update_graph()
+
+    def refresh_all_content(self):
+        """Re-extract content from all tabs"""
+        print("⟳ Refreshing content for all tabs...")
+        tabs = self.get_web_tabs()
+        for idx, tab_data in tabs.items():
+            widget = tab_data['widget']
+            if isinstance(widget, BrowserTab):
+                widget.extract_page_content()
     
     def _load_similarity_cache(self):
         """Load cached similarity scores from disk"""
@@ -633,10 +660,11 @@ class Browser(QMainWindow):
 
             widget = self.tabs.widget(i)
             if isinstance(widget, BrowserTab):
+                content = widget.page_content if hasattr(widget, 'page_content') else ""
                 tabs[i] = {
                     'title': self.tabs.tabText(i),
                     'url': widget.web_view.url().toString(),
-                    'content': widget.page_content,
+                    'content': content,
                     'widget': widget
                 }
         return tabs
@@ -667,16 +695,18 @@ class Browser(QMainWindow):
         for tab_data in tabs.values():
             if tab_data['url'] == url1:
                 content1 = tab_data['content']
-            elif tab_data['url'] == url2:
+            if tab_data['url'] == url2:
                 content2 = tab_data['content']
 
-        # If either page has no content yet, return low similarity
+        # If either page has no content yet, cache and return low similarity
         if not content1 or not content2:
-            return 0.1
+            # Cache the low result to prevent repeated checks
+            self.similarity_cache[cache_key] = 0.0
+            return 0.0
 
         try:
             # Use Claude to analyze similarity
-            prompt = f"""You are analyzing the semantic similarity between two web pages.
+            prompt = f"""You are analyzing the semantic similarity between two web pages. Provide a precise similarity score.
 
 Page 1 URL: {url1}
 Page 1 Content:
@@ -686,17 +716,20 @@ Page 2 URL: {url2}
 Page 2 Content:
 {content2[:3000]}
 
-Analyze how similar these two pages are in terms of:
-- Topic and subject matter
-- Content type (article, documentation, shopping, etc.)
-- Domain/category (news, tech, sports, etc.)
+Analyze how similar these pages are based on:
+- Topic and subject matter (most important)
+- Content type (article, documentation, shopping, social media, etc.)
+- Domain/category (news, tech, sports, finance, etc.)
 
-Respond with ONLY a number between 0.0 and 1.0, where:
-- 0.0 = completely unrelated
-- 0.5 = moderately related
-- 1.0 = very similar/same topic
+Respond with ONLY a decimal number between 0.00 and 1.00 (use 2 decimal places for precision):
+- 0.00-0.10 = completely unrelated topics
+- 0.20-0.35 = tangentially related (same broad category)
+- 0.40-0.60 = moderately related (overlapping themes)
+- 0.65-0.80 = closely related (similar topics)
+- 0.85-0.95 = very similar (same specific topic)
+- 0.98-1.00 = nearly identical content
 
-Your response should be just the number, nothing else."""
+Be precise and use the full range. Respond with ONLY the number (e.g., 0.73)."""
 
             message = self.anthropic_client.messages.create(
                 model="claude-3-5-haiku-20241022",  # Fast and cost-effective
@@ -704,16 +737,18 @@ Your response should be just the number, nothing else."""
                 messages=[{"role": "user", "content": prompt}]
             )
 
-            # Parse the response
+            # Parse the response - extract just the number
             response_text = message.content[0].text.strip()
-            similarity = float(response_text)
+            # Take only the first line and extract the number
+            first_line = response_text.split('\n')[0].strip()
+            similarity = float(first_line)
             similarity = max(0.0, min(1.0, similarity))  # Clamp to [0, 1]
 
             # Cache the result
             self.similarity_cache[cache_key] = similarity
             self._save_similarity_cache()
 
-            print(f"✓ Similarity {url1[:30]}... ↔ {url2[:30]}... = {similarity:.2f}")
+            print(f"✓ Similarity: {similarity:.2f} - {url1[:40]}... ↔ {url2[:40]}...")
             return similarity
 
         except Exception as e:

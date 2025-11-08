@@ -1,5 +1,5 @@
 import sys
-from PyQt5.QtCore import QUrl, Qt, QPointF
+from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout, 
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
@@ -14,6 +14,7 @@ class GraphView(QWidget):
         super().__init__()
         self.browser = browser
         self.node_positions = {}
+        self.velocities = {}
         self.dragging_node = None
         self.drag_offset = (0, 0)
         self.panning = False
@@ -24,6 +25,21 @@ class GraphView(QWidget):
         self.hovered_node = None
         self.setMinimumSize(800, 600)
         self.setMouseTracking(True)
+        # Physics parameters
+        self.physics_enabled = True
+        self.physics_interval_ms = 50  # 20 FPS
+        self.attraction_threshold = 0.15
+        self.attraction_strength = 0.8
+        self.repulsion_strength = 2000.0
+        # Separation to keep comfortable distances (pixels)
+        self.min_separation = 80.0
+        self.separation_strength = 8.0
+        self.damping = 0.85
+
+        # Start physics timer
+        self._physics_timer = QTimer(self)
+        self._physics_timer.timeout.connect(self._physics_tick)
+        self._physics_timer.start(self.physics_interval_ms)
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -179,6 +195,132 @@ class GraphView(QWidget):
                     painter.setFont(QFont('Arial', 8))
                     painter.setPen(QPen(QColor(100, 100, 200)))
                     painter.drawText(int(mid_x), int(mid_y), f"{similarity:.2f}")
+
+    def _physics_tick(self):
+        """Timer tick: apply a small physics step and request repaint."""
+        if not self.physics_enabled:
+            return
+        # dt in seconds
+        dt = max(0.001, self.physics_interval_ms / 1000.0)
+        self.apply_physics(dt)
+        # repaint will be triggered by update in apply_physics
+
+    def apply_physics(self, dt):
+        """Apply a simple force-directed layout step.
+
+        - Attractive force between nodes is proportional to similarity (weight).
+        - Repulsive force between all nodes prevents overlap.
+        - Velocities are damped each step to settle the system.
+
+        Positions are updated in-place in self.node_positions.
+        """
+        tabs = self.browser.get_web_tabs()
+        node_ids = list(self.node_positions.keys())
+        n = len(node_ids)
+        if n < 2:
+            return
+
+        # Ensure velocity entries exist
+        for nid in node_ids:
+            if nid not in self.velocities:
+                self.velocities[nid] = (0.0, 0.0)
+
+        # Prepare force accumulator
+        forces = {nid: [0.0, 0.0] for nid in node_ids}
+
+        # Pairwise interactions
+        for i, id1 in enumerate(node_ids):
+            x1, y1 = self.node_positions[id1]
+            for id2 in node_ids[i+1:]:
+                x2, y2 = self.node_positions[id2]
+                dx = x2 - x1
+                dy = y2 - y1
+                dist_sq = dx*dx + dy*dy
+                dist = math.sqrt(dist_sq) if dist_sq > 0 else 0.001
+
+                # repulsive force (to avoid overlap), inverse-square
+                repulse_mag = self.repulsion_strength / (dist_sq + 1.0)
+                fx = (dx / dist) * repulse_mag
+                fy = (dy / dist) * repulse_mag
+
+                # apply equal and opposite repulsion
+                forces[id1][0] -= fx
+                forces[id1][1] -= fy
+                forces[id2][0] += fx
+                forces[id2][1] += fy
+
+                # attractive force based on similarity (only if above threshold)
+                try:
+                    sim = float(self.browser.calculate_similarity(
+                        tabs[id1]['url'], tabs[id2]['url']
+                    ))
+                except Exception:
+                    sim = 0.0
+
+                if sim > self.attraction_threshold:
+                    # desired distance decreases with higher similarity
+                    desired = 100.0 * (1.0 - min(0.9, sim)) + 30.0
+                    # spring-like attraction: F = k * (dist - desired)
+                    k = self.attraction_strength * sim
+                    spring_mag = k * (dist - desired)
+                    sfx = (dx / dist) * spring_mag
+                    sfy = (dy / dist) * spring_mag
+                    # attraction pulls nodes together (opposite sign)
+                    forces[id1][0] += sfx
+                    forces[id1][1] += sfy
+                    forces[id2][0] -= sfx
+                    forces[id2][1] -= sfy
+
+                # Additional separation when nodes are too close to prevent overlap
+                try:
+                    min_sep = float(self.min_separation)
+                except Exception:
+                    min_sep = 80.0
+
+                if dist < min_sep:
+                    # overlap amount
+                    overlap = max(0.0, min_sep - dist)
+                    sep_mag = self.separation_strength * overlap
+                    # push nodes apart along the line connecting them
+                    sfx2 = (dx / dist) * sep_mag
+                    sfy2 = (dy / dist) * sep_mag
+                    forces[id1][0] -= sfx2
+                    forces[id1][1] -= sfy2
+                    forces[id2][0] += sfx2
+                    forces[id2][1] += sfy2
+
+        # Integrate velocities and update positions
+        max_disp = 200.0 * dt  # clamp per-step displacement for stability
+        for nid in node_ids:
+            fx, fy = forces[nid]
+            vx, vy = self.velocities.get(nid, (0.0, 0.0))
+
+            # acceleration = force (mass=1)
+            ax = fx
+            ay = fy
+
+            # integrate
+            vx = (vx + ax * dt) * self.damping
+            vy = (vy + ay * dt) * self.damping
+
+            # clamp velocity to max_disp/dt
+            vmax = max_disp / max(1e-6, dt)
+            vmag = math.sqrt(vx*vx + vy*vy)
+            if vmag > vmax:
+                scale = vmax / vmag
+                vx *= scale
+                vy *= scale
+
+            # update position
+            x, y = self.node_positions[nid]
+            nx = x + vx * dt
+            ny = y + vy * dt
+
+            self.node_positions[nid] = (nx, ny)
+            self.velocities[nid] = (vx, vy)
+
+        # Request repaint
+        self.update()
     
     def mousePressEvent(self, event):
         """Handle mouse press for dragging nodes or panning"""
@@ -370,6 +512,8 @@ class Browser(QMainWindow):
         
         # Add first browser tab
         self.add_new_tab()
+
+        self.weights = {};
     
     def add_new_tab(self, url='https://www.google.com'):
         """Add a new browser tab"""
@@ -433,7 +577,12 @@ class Browser(QMainWindow):
         - User browsing patterns
         """
 
-        return random.random();
+        if not f'{url1}-{url2}' in self.weights:
+            w = random.random();
+            self.weights[f'{url1}-{url2}'] = w;
+            self.weights[f'{url2}-{url1}'] = w;
+        
+        return self.weights[f'{url1}-{url2}'];
 
         # Simple domain-based similarity
         # try:

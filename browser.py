@@ -64,36 +64,8 @@ class GraphView(QWidget):
         painter.scale(self.zoom, self.zoom)
         
         # Draw edges (connections between tabs)
-        painter.setPen(QPen(QColor(150, 150, 150), 2))
-        for i, idx1 in enumerate(tab_indices):
-            for idx2 in tab_indices[i+1:]:
-                similarity = self.browser.calculate_similarity(
-                    tabs[idx1]['url'], tabs[idx2]['url']
-                )
-                
-                # Draw edge if similarity exceeds threshold
-                if similarity > 0.3:
-                    x1, y1 = self.node_positions[idx1]
-                    x2, y2 = self.node_positions[idx2]
-                    
-                    # Line thickness based on similarity
-                    thickness = int(1 + similarity * 5)
-                    alpha = int(50 + similarity * 200)
-                    
-                    # Highlight edge if either node is hovered
-                    if self.hovered_node in (idx1, idx2):
-                        painter.setPen(QPen(QColor(100, 150, 255, alpha), thickness + 1))
-                    else:
-                        painter.setPen(QPen(QColor(100, 100, 200, alpha), thickness))
-                    
-                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-                    
-                    # Draw similarity score at midpoint
-                    mid_x = (x1 + x2) / 2
-                    mid_y = (y1 + y2) / 2
-                    painter.setFont(QFont('Arial', 8))
-                    painter.setPen(QPen(QColor(100, 100, 200)))
-                    painter.drawText(int(mid_x), int(mid_y), f"{similarity:.2f}")
+        # Draw edges (connections between tabs)
+        self.draw_edges(painter, tabs, tab_indices)
         
         # Draw nodes
         for idx, (x, y) in self.node_positions.items():
@@ -151,6 +123,51 @@ class GraphView(QWidget):
             if distance <= 35:  # Max node radius
                 return idx
         return None
+
+    def draw_edges(self, painter, tabs, tab_indices, threshold=0.3):
+        """Draw edges between nodes when similarity exceeds threshold.
+
+        painter: QPainter already transformed for pan/zoom
+        tabs: dict mapping tab index -> {'title', 'url', 'widget'}
+        tab_indices: list of tab indices in display order
+        threshold: similarity cutoff (0..1)
+        """
+        if not tab_indices or len(tab_indices) < 2:
+            return
+
+        for i, idx1 in enumerate(tab_indices):
+            for idx2 in tab_indices[i+1:]:
+                try:
+                    similarity = self.browser.calculate_similarity(
+                        tabs[idx1]['url'], tabs[idx2]['url']
+                    )
+                except Exception:
+                    similarity = 0.0
+
+                # Draw edge if similarity exceeds threshold
+                if similarity > threshold:
+                    x1, y1 = self.node_positions[idx1]
+                    x2, y2 = self.node_positions[idx2]
+
+                    # Line thickness and alpha based on similarity
+                    thickness = max(1, int(1 + similarity * 5))
+                    alpha = max(30, min(255, int(50 + similarity * 200)))
+
+                    # Highlight edge if either node is hovered
+                    if self.hovered_node in (idx1, idx2):
+                        pen = QPen(QColor(100, 150, 255, alpha), thickness + 1)
+                    else:
+                        pen = QPen(QColor(100, 100, 200, alpha), thickness)
+
+                    painter.setPen(pen)
+                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+                    # Draw similarity score at midpoint
+                    mid_x = (x1 + x2) / 2
+                    mid_y = (y1 + y2) / 2
+                    painter.setFont(QFont('Arial', 8))
+                    painter.setPen(QPen(QColor(100, 100, 200)))
+                    painter.drawText(int(mid_x), int(mid_y), f"{similarity:.2f}")
     
     def mousePressEvent(self, event):
         """Handle mouse press for dragging nodes or panning"""

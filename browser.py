@@ -13,7 +13,16 @@ class GraphView(QWidget):
         super().__init__()
         self.browser = browser
         self.node_positions = {}
+        self.dragging_node = None
+        self.drag_offset = (0, 0)
+        self.panning = False
+        self.pan_start = None
+        self.offset_x = 0
+        self.offset_y = 0
+        self.zoom = 1.0
+        self.hovered_node = None
         self.setMinimumSize(800, 600)
+        self.setMouseTracking(True)
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -29,21 +38,35 @@ class GraphView(QWidget):
                            "No tabs to display\nOpen some web pages to see the graph")
             return
         
-        # Calculate node positions in a circle
+        # Calculate node positions in a circle if not already set
         center_x = self.width() / 2
         center_y = self.height() / 2
         radius = min(self.width(), self.height()) / 3
         
-        for i, (idx, tab_data) in enumerate(tabs.items()):
-            angle = 2 * math.pi * i / len(tabs)
-            x = center_x + radius * math.cos(angle)
-            y = center_y + radius * math.sin(angle)
-            self.node_positions[idx] = (x, y)
+        tab_indices = list(tabs.keys())
+        for i, idx in enumerate(tab_indices):
+            if idx not in self.node_positions:
+                angle = 2 * math.pi * i / len(tab_indices)
+                x = center_x + radius * math.cos(angle)
+                y = center_y + radius * math.sin(angle)
+                self.node_positions[idx] = (x, y)
+        
+        # Remove positions for closed tabs
+        for idx in list(self.node_positions.keys()):
+            if idx not in tabs:
+                del self.node_positions[idx]
+        
+        # Save the transform state
+        painter.save()
+        
+        # Apply zoom and pan transformations
+        painter.translate(self.offset_x, self.offset_y)
+        painter.scale(self.zoom, self.zoom)
         
         # Draw edges (connections between tabs)
         painter.setPen(QPen(QColor(150, 150, 150), 2))
-        for i, idx1 in enumerate(tabs.keys()):
-            for idx2 in list(tabs.keys())[i+1:]:
+        for i, idx1 in enumerate(tab_indices):
+            for idx2 in tab_indices[i+1:]:
                 similarity = self.browser.calculate_similarity(
                     tabs[idx1]['url'], tabs[idx2]['url']
                 )
@@ -56,7 +79,13 @@ class GraphView(QWidget):
                     # Line thickness based on similarity
                     thickness = int(1 + similarity * 5)
                     alpha = int(50 + similarity * 200)
-                    painter.setPen(QPen(QColor(100, 100, 200, alpha), thickness))
+                    
+                    # Highlight edge if either node is hovered
+                    if self.hovered_node in (idx1, idx2):
+                        painter.setPen(QPen(QColor(100, 150, 255, alpha), thickness + 1))
+                    else:
+                        painter.setPen(QPen(QColor(100, 100, 200, alpha), thickness))
+                    
                     painter.drawLine(int(x1), int(y1), int(x2), int(y2))
                     
                     # Draw similarity score at midpoint
@@ -70,10 +99,25 @@ class GraphView(QWidget):
         for idx, (x, y) in self.node_positions.items():
             tab_data = tabs[idx]
             
+            # Node appearance based on state
+            if idx == self.hovered_node:
+                node_color = QColor(100, 180, 255)  # Light blue for hover
+                border_color = QColor(70, 130, 200)
+                radius = 33
+            else:
+                node_color = QColor(70, 130, 180)  # Default blue
+                border_color = QColor(50, 80, 130)
+                radius = 30
+            
+            # Node circle with shadow
+            painter.setBrush(QBrush(QColor(0, 0, 0, 50)))
+            painter.setPen(QPen(Qt.NoPen))
+            painter.drawEllipse(QPointF(x + 2, y + 2), radius, radius)
+            
             # Node circle
-            painter.setBrush(QBrush(QColor(70, 130, 180)))
-            painter.setPen(QPen(QColor(50, 80, 130), 3))
-            painter.drawEllipse(QPointF(x, y), 30, 30)
+            painter.setBrush(QBrush(node_color))
+            painter.setPen(QPen(border_color, 3))
+            painter.drawEllipse(QPointF(x, y), radius, radius)
             
             # Tab title
             painter.setPen(QPen(Qt.black))
@@ -82,25 +126,131 @@ class GraphView(QWidget):
             
             # Draw title below node
             text_rect = painter.boundingRect(0, 0, 200, 50, Qt.AlignCenter, title)
-            text_rect.moveCenter(QPointF(x, y + 50).toPoint())
+            text_rect.moveCenter(QPointF(x, y + radius + 25).toPoint())
             
             # Background for text
-            painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
+            painter.setBrush(QBrush(QColor(255, 255, 255, 220)))
             painter.setPen(QPen(Qt.NoPen))
             painter.drawRect(text_rect.adjusted(-5, -2, 5, 2))
             
             # Text
             painter.setPen(QPen(Qt.black))
             painter.drawText(text_rect, Qt.AlignCenter, title)
+        
+        # Restore painter state
+        painter.restore()
+    
+    def get_node_at_pos(self, screen_x, screen_y):
+        """Get node index at screen position, accounting for zoom and pan"""
+        # Transform screen coordinates to graph coordinates
+        graph_x = (screen_x - self.offset_x) / self.zoom
+        graph_y = (screen_y - self.offset_y) / self.zoom
+        
+        for idx, (x, y) in self.node_positions.items():
+            distance = math.sqrt((graph_x - x)**2 + (graph_y - y)**2)
+            if distance <= 35:  # Max node radius
+                return idx
+        return None
     
     def mousePressEvent(self, event):
-        """Handle clicks on nodes to switch to that tab"""
+        """Handle mouse press for dragging nodes or panning"""
         pos = event.pos()
-        for idx, (x, y) in self.node_positions.items():
-            distance = math.sqrt((pos.x() - x)**2 + (pos.y() - y)**2)
-            if distance <= 30:
-                self.browser.tabs.setCurrentIndex(idx)
-                break
+        node_idx = self.get_node_at_pos(pos.x(), pos.y())
+        
+        if event.button() == Qt.LeftButton:
+            if node_idx is not None:
+                # Start dragging node
+                self.dragging_node = node_idx
+                node_x, node_y = self.node_positions[node_idx]
+                graph_x = (pos.x() - self.offset_x) / self.zoom
+                graph_y = (pos.y() - self.offset_y) / self.zoom
+                self.drag_offset = (graph_x - node_x, graph_y - node_y)
+            else:
+                # Start panning
+                self.panning = True
+                self.pan_start = (pos.x(), pos.y())
+                self.setCursor(Qt.ClosedHandCursor)
+        
+        elif event.button() == Qt.RightButton:
+            if node_idx is not None:
+                # Right-click to switch to tab
+                self.browser.tabs.setCurrentIndex(node_idx)
+    
+    def mouseMoveEvent(self, event):
+        """Handle mouse move for dragging or panning"""
+        pos = event.pos()
+        
+        if self.dragging_node is not None:
+            # Drag node
+            graph_x = (pos.x() - self.offset_x) / self.zoom
+            graph_y = (pos.y() - self.offset_y) / self.zoom
+            
+            new_x = graph_x - self.drag_offset[0]
+            new_y = graph_y - self.drag_offset[1]
+            
+            self.node_positions[self.dragging_node] = (new_x, new_y)
+            self.update()
+            
+        elif self.panning:
+            # Pan view
+            dx = pos.x() - self.pan_start[0]
+            dy = pos.y() - self.pan_start[1]
+            
+            self.offset_x += dx
+            self.offset_y += dy
+            
+            self.pan_start = (pos.x(), pos.y())
+            self.update()
+            
+        else:
+            # Update hover state
+            old_hover = self.hovered_node
+            self.hovered_node = self.get_node_at_pos(pos.x(), pos.y())
+            
+            if self.hovered_node != old_hover:
+                self.update()
+            
+            # Update cursor
+            if self.hovered_node is not None:
+                self.setCursor(Qt.PointingHandCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+    
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release"""
+        if event.button() == Qt.LeftButton:
+            self.dragging_node = None
+            self.panning = False
+            self.setCursor(Qt.ArrowCursor)
+    
+    def mouseDoubleClickEvent(self, event):
+        """Double-click to switch to tab"""
+        pos = event.pos()
+        node_idx = self.get_node_at_pos(pos.x(), pos.y())
+        
+        if node_idx is not None:
+            self.browser.tabs.setCurrentIndex(node_idx)
+    
+    def wheelEvent(self, event):
+        """Handle mouse wheel for zooming"""
+        delta = event.angleDelta().y()
+        zoom_factor = 1.1 if delta > 0 else 0.9
+        
+        # Get mouse position
+        mouse_x = event.x()
+        mouse_y = event.y()
+        
+        # Zoom relative to mouse position
+        old_zoom = self.zoom
+        self.zoom *= zoom_factor
+        self.zoom = max(0.3, min(3.0, self.zoom))
+        
+        # Adjust offset to zoom towards mouse
+        zoom_change = self.zoom / old_zoom
+        self.offset_x = mouse_x - (mouse_x - self.offset_x) * zoom_change
+        self.offset_y = mouse_y - (mouse_y - self.offset_y) * zoom_change
+        
+        self.update()
 
 
 class BrowserTab(QWidget):

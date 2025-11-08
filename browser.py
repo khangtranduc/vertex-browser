@@ -1,8 +1,8 @@
 import sys
 import os
 import json
-from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer
-from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath
+from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize
+from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -20,6 +20,8 @@ class GraphView(QWidget):
         self.velocities = {}
         self.dragging_node = None
         self.drag_offset = (0, 0)
+        self.drag_start_pos = None
+        self.has_dragged = False
         self.panning = False
         self.pan_start = None
         self.offset_x = 0
@@ -135,6 +137,16 @@ class GraphView(QWidget):
             painter.setPen(QPen(border_color, border_width))
             painter.drawEllipse(QPointF(x, y), radius, radius)
 
+            # Draw favicon in center of node
+            if 'icon' in tab_data and not tab_data['icon'].isNull():
+                icon_size = 20 if idx == self.hovered_node else 18
+                pixmap = tab_data['icon'].pixmap(QSize(icon_size, icon_size))
+                painter.drawPixmap(
+                    int(x - icon_size / 2),
+                    int(y - icon_size / 2),
+                    pixmap
+                )
+
             # Tab title
             painter.setFont(QFont('SF Pro Display', 10, QFont.Normal))
             title = tab_data['title'][:25] + '...' if len(tab_data['title']) > 25 else tab_data['title']
@@ -151,7 +163,55 @@ class GraphView(QWidget):
             # Dark gray text
             painter.setPen(QPen(QColor(60, 64, 67)))
             painter.drawText(text_rect, Qt.AlignCenter, title)
-        
+
+            # Draw close button when hovered
+            if idx == self.hovered_node:
+                close_btn_x = x + radius - 10
+                close_btn_y = y - radius + 10
+                close_btn_radius = 8
+
+                # Close button background
+                painter.setBrush(QBrush(QColor(220, 53, 69)))
+                painter.setPen(QPen(QColor(200, 40, 55), 1))
+                painter.drawEllipse(QPointF(close_btn_x, close_btn_y), close_btn_radius, close_btn_radius)
+
+                # X symbol
+                painter.setPen(QPen(QColor(255, 255, 255), 2))
+                offset = 4
+                painter.drawLine(
+                    int(close_btn_x - offset), int(close_btn_y - offset),
+                    int(close_btn_x + offset), int(close_btn_y + offset)
+                )
+                painter.drawLine(
+                    int(close_btn_x + offset), int(close_btn_y - offset),
+                    int(close_btn_x - offset), int(close_btn_y + offset)
+                )
+
+                # Store close button position for click detection
+                if not hasattr(self, 'close_button_positions'):
+                    self.close_button_positions = {}
+                self.close_button_positions[idx] = (close_btn_x, close_btn_y, close_btn_radius)
+
+                # Show URL tooltip on hover
+                url = tab_data['url']
+                if len(url) > 60:
+                    url = url[:60] + '...'
+
+                # Draw tooltip
+                tooltip_font = QFont('SF Pro Display', 9)
+                painter.setFont(tooltip_font)
+                tooltip_rect = painter.boundingRect(0, 0, 400, 30, Qt.AlignLeft, url)
+                tooltip_rect.moveCenter(QPointF(x, y - radius - 35).toPoint())
+
+                # Tooltip background
+                painter.setBrush(QBrush(QColor(50, 55, 60, 240)))
+                painter.setPen(QPen(Qt.NoPen))
+                painter.drawRoundedRect(tooltip_rect.adjusted(-10, -5, 10, 5), 5, 5)
+
+                # Tooltip text
+                painter.setPen(QPen(QColor(240, 245, 250)))
+                painter.drawText(tooltip_rect, Qt.AlignCenter, url)
+
         # Restore painter state
         painter.restore()
     
@@ -374,15 +434,38 @@ class GraphView(QWidget):
         # Request repaint
         self.update()
     
+    def is_on_close_button(self, screen_x, screen_y):
+        """Check if click is on a close button"""
+        if not hasattr(self, 'close_button_positions'):
+            return None
+
+        graph_x = (screen_x - self.offset_x) / self.zoom
+        graph_y = (screen_y - self.offset_y) / self.zoom
+
+        for idx, (btn_x, btn_y, btn_radius) in self.close_button_positions.items():
+            dist = math.sqrt((graph_x - btn_x)**2 + (graph_y - btn_y)**2)
+            if dist <= btn_radius:
+                return idx
+        return None
+
     def mousePressEvent(self, event):
         """Handle mouse press for dragging nodes or panning"""
         pos = event.pos()
+
+        # Check if clicking close button first
+        close_idx = self.is_on_close_button(pos.x(), pos.y())
+        if close_idx is not None and event.button() == Qt.LeftButton:
+            self.browser.close_tab(close_idx)
+            return
+
         node_idx = self.get_node_at_pos(pos.x(), pos.y())
-        
+
         if event.button() == Qt.LeftButton:
             if node_idx is not None:
-                # Start dragging node
+                # Track potential drag vs click
                 self.dragging_node = node_idx
+                self.drag_start_pos = pos
+                self.has_dragged = False
                 node_x, node_y = self.node_positions[node_idx]
                 graph_x = (pos.x() - self.offset_x) / self.zoom
                 graph_y = (pos.y() - self.offset_y) / self.zoom
@@ -392,7 +475,7 @@ class GraphView(QWidget):
                 self.panning = True
                 self.pan_start = (pos.x(), pos.y())
                 self.setCursor(Qt.ClosedHandCursor)
-        
+
         elif event.button() == Qt.RightButton:
             if node_idx is not None:
                 # Right-click to switch to tab
@@ -401,15 +484,22 @@ class GraphView(QWidget):
     def mouseMoveEvent(self, event):
         """Handle mouse move for dragging or panning"""
         pos = event.pos()
-        
+
         if self.dragging_node is not None:
+            # Check if we've moved enough to count as a drag
+            if hasattr(self, 'drag_start_pos'):
+                dx = pos.x() - self.drag_start_pos.x()
+                dy = pos.y() - self.drag_start_pos.y()
+                if abs(dx) > 5 or abs(dy) > 5:
+                    self.has_dragged = True
+
             # Drag node
             graph_x = (pos.x() - self.offset_x) / self.zoom
             graph_y = (pos.y() - self.offset_y) / self.zoom
-            
+
             new_x = graph_x - self.drag_offset[0]
             new_y = graph_y - self.drag_offset[1]
-            
+
             self.node_positions[self.dragging_node] = (new_x, new_y)
             self.update()
             
@@ -441,8 +531,13 @@ class GraphView(QWidget):
     def mouseReleaseEvent(self, event):
         """Handle mouse release"""
         if event.button() == Qt.LeftButton:
+            # If we were on a node and didn't drag, switch to that tab
+            if self.dragging_node is not None and not self.has_dragged:
+                self.browser.tabs.setCurrentIndex(self.dragging_node)
+
             self.dragging_node = None
             self.panning = False
+            self.has_dragged = False
             self.setCursor(Qt.ArrowCursor)
     
     def mouseDoubleClickEvent(self, event):
@@ -709,11 +804,14 @@ class Browser(QMainWindow):
             widget = self.tabs.widget(i)
             if isinstance(widget, BrowserTab):
                 content = widget.page_content if hasattr(widget, 'page_content') else ""
+                # Get favicon from the web page
+                icon = widget.web_view.icon()
                 tabs[i] = {
                     'title': self.tabs.tabText(i),
                     'url': widget.web_view.url().toString(),
                     'content': content,
-                    'widget': widget
+                    'widget': widget,
+                    'icon': icon
                 }
         return tabs
     

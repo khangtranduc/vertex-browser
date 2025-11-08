@@ -1,11 +1,14 @@
 import sys
+import os
+import json
 from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 import math
 import random
+from anthropic import Anthropic
 
 class GraphView(QWidget):
     """Widget that displays a graph visualization of browser tabs"""
@@ -425,39 +428,41 @@ class GraphView(QWidget):
 
 class BrowserTab(QWidget):
     """Individual browser tab with address bar and web view"""
-    
+
     def __init__(self):
         super().__init__()
         self.web_view = QWebEngineView()
-        
+        self.page_content = ""  # Store extracted page content
+        self.content_extraction_pending = False
+
         # Layout
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Navigation bar
         nav_bar = QHBoxLayout()
-        
+
         self.back_btn = QPushButton('←')
         self.forward_btn = QPushButton('→')
         self.reload_btn = QPushButton('⟳')
-        
+
         self.url_bar = QLineEdit()
         self.url_bar.returnPressed.connect(self.navigate_to_url)
-        
+
         self.go_btn = QPushButton('Go')
         self.go_btn.clicked.connect(self.navigate_to_url)
-        
+
         nav_bar.addWidget(self.back_btn)
         nav_bar.addWidget(self.forward_btn)
         nav_bar.addWidget(self.reload_btn)
         nav_bar.addWidget(self.url_bar)
         nav_bar.addWidget(self.go_btn)
-        
+
         layout.addLayout(nav_bar)
         layout.addWidget(self.web_view)
-        
+
         self.setLayout(layout)
-        
+
         # Connect signals
         self.back_btn.clicked.connect(self.web_view.back)
         self.forward_btn.clicked.connect(self.web_view.forward)
@@ -474,10 +479,47 @@ class BrowserTab(QWidget):
     def update_url_bar(self, url):
         self.url_bar.setText(url.toString())
     
+    def extract_page_content(self):
+        """Extract text content from the current page"""
+        if self.content_extraction_pending:
+            return
+
+        self.content_extraction_pending = True
+
+        # JavaScript to extract visible text from the page
+        js_code = """
+        (function() {
+            // Get text from body, excluding script and style tags
+            let clone = document.body.cloneNode(true);
+            let scripts = clone.getElementsByTagName('script');
+            let styles = clone.getElementsByTagName('style');
+
+            for (let i = scripts.length - 1; i >= 0; i--) {
+                scripts[i].remove();
+            }
+            for (let i = styles.length - 1; i >= 0; i--) {
+                styles[i].remove();
+            }
+
+            let text = clone.innerText || clone.textContent || '';
+            // Limit to first 10000 characters to avoid huge API calls
+            return text.substring(0, 10000);
+        })();
+        """
+
+        def handle_content(result):
+            if result:
+                self.page_content = result
+            self.content_extraction_pending = False
+            # Trigger graph update after content is extracted
+            if hasattr(self.parent(), 'update_graph'):
+                self.parent().update_graph()
+
+        self.web_view.page().runJavaScript(js_code, handle_content)
+
     def on_load_finished(self):
-        # Trigger graph update when page loads
-        if hasattr(self.parent(), 'update_graph'):
-            self.parent().update_graph()
+        # Extract page content when page loads
+        self.extract_page_content()
 
 
 class Browser(QMainWindow):
@@ -487,33 +529,46 @@ class Browser(QMainWindow):
         super().__init__()
         self.setWindowTitle('PyQt Web Browser with Graph View')
         self.setGeometry(100, 100, 1200, 800)
-        
+
         # Initialize graph_tab_index early
         self.graph_tab_index = 0
-        
+
         # Tab widget
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
-        
+
         # Create graph view tab first
         self.graph_view = GraphView(self)
         self.graph_tab_index = self.tabs.addTab(self.graph_view, 'Graph View')
-        
+
         # Connect tab changed signal after graph_tab_index is set
         self.tabs.currentChanged.connect(self.on_tab_changed)
-        
+
         # Add new tab button
         new_tab_btn = QPushButton('+')
         new_tab_btn.clicked.connect(self.add_new_tab)
         self.tabs.setCornerWidget(new_tab_btn)
-        
+
         self.setCentralWidget(self.tabs)
-        
+
         # Add first browser tab
         self.add_new_tab()
 
-        self.weights = {};
+        # Initialize Anthropic client
+        api_key = os.environ.get('ANTHROPIC_API_KEY')
+        if api_key:
+            self.anthropic_client = Anthropic(api_key=api_key)
+            print("✓ Anthropic API initialized")
+        else:
+            self.anthropic_client = None
+            print("⚠ ANTHROPIC_API_KEY not set - using random similarity")
+
+        # Cache for similarity scores (url1-url2 -> score)
+        self.similarity_cache = {}
+        # Cache file for persistent storage
+        self.cache_file = os.path.expanduser('~/.vertex_browser_cache.json')
+        self._load_similarity_cache()
     
     def add_new_tab(self, url='https://www.google.com'):
         """Add a new browser tab"""
@@ -550,68 +605,128 @@ class Browser(QMainWindow):
             self.tabs.setTabText(idx, short_title)
             self.update_graph()
     
+    def _load_similarity_cache(self):
+        """Load cached similarity scores from disk"""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r') as f:
+                    self.similarity_cache = json.load(f)
+                print(f"✓ Loaded {len(self.similarity_cache)} cached similarities")
+        except Exception as e:
+            print(f"⚠ Could not load cache: {e}")
+            self.similarity_cache = {}
+
+    def _save_similarity_cache(self):
+        """Save similarity scores to disk"""
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(self.similarity_cache, f)
+        except Exception as e:
+            print(f"⚠ Could not save cache: {e}")
+
     def get_web_tabs(self):
         """Get all web tabs (excluding graph view)"""
         tabs = {}
         for i in range(self.tabs.count()):
             if i == self.graph_tab_index:
                 continue
-            
+
             widget = self.tabs.widget(i)
             if isinstance(widget, BrowserTab):
                 tabs[i] = {
                     'title': self.tabs.tabText(i),
                     'url': widget.web_view.url().toString(),
+                    'content': widget.page_content,
                     'widget': widget
                 }
         return tabs
     
     def calculate_similarity(self, url1, url2):
         """
-        Calculate similarity between two tabs based on their URLs.
-        This is a placeholder implementation - users can replace this with
-        more sophisticated similarity metrics like:
-        - Content-based similarity (TF-IDF, embeddings)
-        - Domain similarity
-        - Topic modeling
-        - User browsing patterns
+        Calculate similarity between two tabs using Claude AI to analyze
+        page content. Returns a float between 0.0 and 1.0.
         """
+        # Create a cache key (ensure consistent ordering)
+        cache_key = f"{min(url1, url2)}||{max(url1, url2)}"
 
-        if not f'{url1}-{url2}' in self.weights:
-            w = random.random();
-            self.weights[f'{url1}-{url2}'] = w;
-            self.weights[f'{url2}-{url1}'] = w;
-        
-        return self.weights[f'{url1}-{url2}'];
+        # Check cache first
+        if cache_key in self.similarity_cache:
+            return self.similarity_cache[cache_key]
 
-        # Simple domain-based similarity
-        # try:
-        #     domain1 = QUrl(url1).host()
-        #     domain2 = QUrl(url2).host()
-            
-        #     # Same domain = high similarity
-        #     if domain1 == domain2:
-        #         return 0.9
-            
-        #     # Same top-level domain = medium similarity
-        #     tld1 = '.'.join(domain1.split('.')[-2:]) if '.' in domain1 else domain1
-        #     tld2 = '.'.join(domain2.split('.')[-2:]) if '.' in domain2 else domain2
-            
-        #     if tld1 == tld2:
-        #         return 0.5
-            
-        #     # Check for common keywords
-        #     keywords1 = set(domain1.lower().split('.'))
-        #     keywords2 = set(domain2.lower().split('.'))
-        #     common = keywords1.intersection(keywords2)
-            
-        #     if common:
-        #         return 0.4
-            
-        #     return 0.1  # Low default similarity
-            
-        # except:
-        #     return 0.0
+        # If no API client, fall back to random similarity
+        if not self.anthropic_client:
+            score = random.random()
+            self.similarity_cache[cache_key] = score
+            return score
+
+        # Get tab content for both URLs
+        tabs = self.get_web_tabs()
+        content1 = None
+        content2 = None
+
+        for tab_data in tabs.values():
+            if tab_data['url'] == url1:
+                content1 = tab_data['content']
+            elif tab_data['url'] == url2:
+                content2 = tab_data['content']
+
+        # If either page has no content yet, return low similarity
+        if not content1 or not content2:
+            return 0.1
+
+        try:
+            # Use Claude to analyze similarity
+            prompt = f"""You are analyzing the semantic similarity between two web pages.
+
+Page 1 URL: {url1}
+Page 1 Content:
+{content1[:3000]}
+
+Page 2 URL: {url2}
+Page 2 Content:
+{content2[:3000]}
+
+Analyze how similar these two pages are in terms of:
+- Topic and subject matter
+- Content type (article, documentation, shopping, etc.)
+- Domain/category (news, tech, sports, etc.)
+
+Respond with ONLY a number between 0.0 and 1.0, where:
+- 0.0 = completely unrelated
+- 0.5 = moderately related
+- 1.0 = very similar/same topic
+
+Your response should be just the number, nothing else."""
+
+            message = self.anthropic_client.messages.create(
+                model="claude-3-5-haiku-20241022",  # Fast and cost-effective
+                max_tokens=10,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            # Parse the response
+            response_text = message.content[0].text.strip()
+            similarity = float(response_text)
+            similarity = max(0.0, min(1.0, similarity))  # Clamp to [0, 1]
+
+            # Cache the result
+            self.similarity_cache[cache_key] = similarity
+            self._save_similarity_cache()
+
+            print(f"✓ Similarity {url1[:30]}... ↔ {url2[:30]}... = {similarity:.2f}")
+            return similarity
+
+        except Exception as e:
+            print(f"⚠ Error calculating similarity: {e}")
+            # Fall back to basic domain comparison
+            try:
+                domain1 = QUrl(url1).host()
+                domain2 = QUrl(url2).host()
+                if domain1 == domain2:
+                    return 0.7
+                return 0.1
+            except:
+                return 0.1
     
     def update_graph(self):
         """Update the graph view"""

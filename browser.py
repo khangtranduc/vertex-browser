@@ -541,7 +541,7 @@ class GraphView(QWidget):
             self.setCursor(Qt.ArrowCursor)
     
     def mouseDoubleClickEvent(self, event):
-        """Double-click to switch to tab"""
+        """Double-click to switch to tab among us"""
         pos = event.pos()
         node_idx = self.get_node_at_pos(pos.x(), pos.y())
         

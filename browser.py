@@ -1139,11 +1139,25 @@ class BrowserTab(QWidget):
             self.content_extraction_pending = False
             # Trigger graph update after content is extracted
             if hasattr(self, 'browser_parent') and self.browser_parent:
-                self.browser_parent.update_graph()
-                # Pre-calculate similarities in background (with delay to avoid blocking)
-                QTimer.singleShot(500, lambda: self.browser_parent.precalculate_similarities())
-                # Pre-generate cluster summaries in background (with delay)
-                QTimer.singleShot(1000, lambda: self.browser_parent.precalculate_cluster_summaries())
+                browser = self.browser_parent
+                browser.update_graph()
+
+                # Check if in batch loading mode
+                if getattr(browser, '_skip_auto_processing', False):
+                    # Increment loaded count
+                    browser._batch_loaded_count = getattr(browser, '_batch_loaded_count', 0) + 1
+                    print(f"  [{browser._batch_loaded_count}/{browser._batch_total_count}] Content extracted")
+
+                    # If all loaded, process once
+                    if browser._batch_loaded_count >= browser._batch_total_count:
+                        print(f"✓ All content extracted - calculating similarities and clusters...")
+                        browser._skip_auto_processing = False
+                        browser.precalculate_similarities()
+                        QTimer.singleShot(2000, lambda: browser.precalculate_cluster_summaries())
+                else:
+                    # Normal auto-processing
+                    QTimer.singleShot(500, lambda: browser.precalculate_similarities())
+                    QTimer.singleShot(1000, lambda: browser.precalculate_cluster_summaries())
 
         self.web_view.page().runJavaScript(js_code, handle_content)
 
@@ -2074,11 +2088,77 @@ class Browser(QMainWindow):
         if idx == self.graph_tab_index:
             self.update_graph()
 
+    def load_urls_from_file(self, file_path):
+        """Load URLs from a text file and open them in tabs.
+
+        File format: One URL per line, blank lines and lines starting with # are ignored.
+        """
+        try:
+            with open(file_path, 'r') as f:
+                urls = []
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    urls.append(line)
+
+            if not urls:
+                print(f"⚠ No URLs found in {file_path}")
+                return
+
+            print(f"📂 Loading {len(urls)} URLs from {file_path}")
+
+            # Disable auto-processing during batch load
+            self._skip_auto_processing = True
+            self._batch_loaded_count = 0
+            self._batch_total_count = len(urls)
+
+            # Load each URL in a new tab
+            for url in urls:
+                try:
+                    self.add_new_tab(url)
+                    print(f"  ✓ Opened: {url}")
+                except Exception as e:
+                    print(f"  ⚠ Failed to open {url}: {e}")
+
+            print(f"✓ Loaded {len(urls)} tabs - waiting for content extraction...")
+
+        except FileNotFoundError:
+            print(f"⚠ File not found: {file_path}")
+        except Exception as e:
+            print(f"⚠ Error loading URLs from file: {e}")
+
 
 def main():
-    app = QApplication(sys.argv)
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Vertex Browser - AI-powered browser with graph visualization')
+    parser.add_argument('--urls', type=str, help='Path to text file containing URLs to load on startup')
+    parser.add_argument('--demo', action='store_true', help='Load demo URLs from demo_urls.txt')
+
+    # Parse known args to allow Qt args to pass through
+    args, unknown = parser.parse_known_args()
+
+    # Reconstruct argv for QApplication (it needs Qt-specific args)
+    qt_argv = [sys.argv[0]] + unknown
+
+    app = QApplication(qt_argv)
     browser = Browser()
+
+    # Load URLs from file if specified (before showing browser)
+    if args.demo:
+        demo_file = os.path.join(os.path.dirname(__file__), 'demo_urls.txt')
+        if os.path.exists(demo_file):
+            browser.load_urls_from_file(demo_file)
+        else:
+            print(f"⚠ Demo file not found: {demo_file}")
+    elif args.urls:
+        browser.load_urls_from_file(args.urls)
+
+    # Show browser (URLs are already loading in background if specified)
     browser.show()
+
     sys.exit(app.exec_())
 
 

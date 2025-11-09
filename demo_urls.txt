@@ -1,0 +1,22 @@
+# Demo URLs for Vertex Browser
+# This file contains sample URLs for testing and demos
+# One URL per line, blank lines and lines starting with # are ignored
+
+# Python Programming
+https://docs.python.org/3/tutorial/
+https://realpython.com/python-basics/
+https://www.learnpython.org/
+
+# Machine Learning
+https://pytorch.org/tutorials/
+https://www.tensorflow.org/tutorials
+https://scikit-learn.org/stable/tutorial/index.html
+
+# Web Development
+https://developer.mozilla.org/en-US/docs/Learn
+https://reactjs.org/
+https://nodejs.org/en/docs/
+
+# Data Science
+https://pandas.pydata.org/docs/getting_started/intro_tutorials/
+https://matplotlib.org/stable/tutorials/index.html

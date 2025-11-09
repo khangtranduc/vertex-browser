@@ -436,10 +436,22 @@ class GraphView(QWidget):
             # Title and description from external callbacks if provided
             title = self.get_cluster_title(self.selected_cluster)
             desc = self.get_cluster_description(self.selected_cluster)
-            # Draw title
+
+            # Draw cluster color indicator (circle next to title)
+            cluster_color = self.cluster_colors.get(self.selected_cluster, QColor(180, 180, 180))
+            indicator_size = 14
+            indicator_x = panel_x + 16
+            indicator_y = panel_y + 26
+
+            # Draw color indicator with border
+            painter.setPen(QPen(cluster_color.darker(120), 2))
+            painter.setBrush(QBrush(cluster_color))
+            painter.drawEllipse(indicator_x, indicator_y, indicator_size, indicator_size)
+
+            # Draw title (shifted right to make room for indicator)
             painter.setPen(QPen(QColor(34, 40, 49)))
             painter.setFont(QFont('SF Pro Display', 12, QFont.Bold))
-            title_rect = QRect(panel_x + 16, panel_y + 20, panel_w - 40, 30)
+            title_rect = QRect(panel_x + 16 + indicator_size + 8, panel_y + 20, panel_w - 40 - indicator_size - 8, 30)
             painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, title)
 
             # Draw tags (chips) below the title if available
@@ -1539,6 +1551,8 @@ class Browser(QMainWindow):
                     if app:
                         # Use invokeMethod to safely call from background thread
                         QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
+                        # Also refresh search panel if open
+                        QMetaObject.invokeMethod(self, "_refresh_search_panel", Qt.QueuedConnection)
                 except Exception as e:
                     print(f"⚠ Error scheduling UI update: {e}")
 
@@ -2042,6 +2056,8 @@ class Browser(QMainWindow):
                                     # Use invokeMethod to safely call from background thread
                                     from PyQt5.QtCore import QMetaObject, Q_ARG
                                     QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
+                                    # Also refresh search panel if open
+                                    QMetaObject.invokeMethod(self, "_refresh_search_panel", Qt.QueuedConnection)
                             except Exception as e:
                                 print(f"⚠ Error scheduling UI update: {e}")
 

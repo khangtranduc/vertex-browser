@@ -1500,20 +1500,24 @@ class Browser(QMainWindow):
         if not node_ids:
             return f"Cluster {cluster_id}"
 
-        key = tuple(sorted(node_ids))
-        if key in self._cluster_summary_cache:
-            return self._cluster_summary_cache[key].title
-
-        # Build documents for summarizer
+        # Build documents for summarizer and create cache key from URLs
         docs = []
         tabs = self.get_web_tabs()
+        urls_for_key = []
         for nid in node_ids:
             td = tabs.get(nid)
             if not td:
                 continue
             widget = td.get('widget')
             content = getattr(widget, 'page_content', '') if widget is not None else ''
-            docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+            url = td.get('url', '')
+            urls_for_key.append(url)
+            docs.append({'url': url, 'title': td.get('title', ''), 'content': content})
+
+        # Cache key includes URLs so it changes when tabs navigate
+        key = tuple(sorted(urls_for_key))
+        if key in self._cluster_summary_cache:
+            return self._cluster_summary_cache[key].title
 
         if not docs or not self.cluster_summarizer:
             return f"Cluster {cluster_id}"
@@ -1633,20 +1637,24 @@ class Browser(QMainWindow):
         if not node_ids:
             return []
 
-        key = tuple(sorted(node_ids))
-        if key in self._cluster_summary_cache:
-            return list(self._cluster_summary_cache[key].tags or [])
-
-        # Build documents for summarizer
+        # Build documents for summarizer and create cache key from URLs
         docs = []
         tabs = self.get_web_tabs()
+        urls_for_key = []
         for nid in node_ids:
             td = tabs.get(nid)
             if not td:
                 continue
             widget = td.get('widget')
             content = getattr(widget, 'page_content', '') if widget is not None else ''
-            docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+            url = td.get('url', '')
+            urls_for_key.append(url)
+            docs.append({'url': url, 'title': td.get('title', ''), 'content': content})
+
+        # Cache key includes URLs so it changes when tabs navigate
+        key = tuple(sorted(urls_for_key))
+        if key in self._cluster_summary_cache:
+            return list(self._cluster_summary_cache[key].tags or [])
 
         if not docs or not self.cluster_summarizer:
             return []
@@ -1703,20 +1711,24 @@ class Browser(QMainWindow):
         if not node_ids:
             return ""
 
-        key = tuple(sorted(node_ids))
-        if key in self._cluster_summary_cache:
-            return self._cluster_summary_cache[key].summary
-
-        # Build documents for summarizer
+        # Build documents for summarizer and create cache key from URLs
         docs = []
         tabs = self.get_web_tabs()
+        urls_for_key = []
         for nid in node_ids:
             td = tabs.get(nid)
             if not td:
                 continue
             widget = td.get('widget')
             content = getattr(widget, 'page_content', '') if widget is not None else ''
-            docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+            url = td.get('url', '')
+            urls_for_key.append(url)
+            docs.append({'url': url, 'title': td.get('title', ''), 'content': content})
+
+        # Cache key includes URLs so it changes when tabs navigate
+        key = tuple(sorted(urls_for_key))
+        if key in self._cluster_summary_cache:
+            return self._cluster_summary_cache[key].summary
 
         if not docs or not self.cluster_summarizer:
             return "(No description available)"
@@ -2007,22 +2019,27 @@ class Browser(QMainWindow):
                 # For each cluster, directly submit summarization tasks
                 for cid, members in groups.items():
                     node_ids = sorted(members)
-                    key = tuple(node_ids)
 
-                    # Skip if already cached or being computed
-                    with self._summary_lock:
-                        if key in self._cluster_summary_cache or key in self._summary_futures:
-                            continue
-
-                    # Build documents for this cluster
+                    # Build documents for this cluster and create cache key from URLs
                     docs = []
+                    urls_for_key = []
                     for nid in node_ids:
                         td = tabs.get(nid)
                         if not td:
                             continue
                         widget = td.get('widget')
                         content = getattr(widget, 'page_content', '') if widget is not None else ''
-                        docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+                        url = td.get('url', '')
+                        urls_for_key.append(url)
+                        docs.append({'url': url, 'title': td.get('title', ''), 'content': content})
+
+                    # Cache key includes URLs so it changes when tabs navigate
+                    key = tuple(sorted(urls_for_key))
+
+                    # Skip if already cached or being computed
+                    with self._summary_lock:
+                        if key in self._cluster_summary_cache or key in self._summary_futures:
+                            continue
 
                     if not docs:
                         continue

@@ -15,28 +15,32 @@ from anthropic import Anthropic
 class ClusterSummary:
     """Represents a summarized cluster of documents"""
 
-    def __init__(self, title: str, summary: str, doc_count: int, urls: List[str]):
+    def __init__(self, title: str, summary: str, doc_count: int, urls: List[str], tags: Optional[List[str]] = None):
         self.title = title
         self.summary = summary  # 2-3 sentence paragraph
         self.doc_count = doc_count
         self.urls = urls
+        self.tags = tags if tags is not None else []  # Backwards compatible - defaults to empty list
 
     def __repr__(self):
-        return f"ClusterSummary(title='{self.title}', docs={self.doc_count})"
+        tag_str = f", tags={len(self.tags)}" if self.tags else ""
+        return f"ClusterSummary(title='{self.title}', docs={self.doc_count}{tag_str})"
 
     def __str__(self):
-        return f"{self.title}: {self.summary}"
+        tag_str = f" [{', '.join(self.tags)}]" if self.tags else ""
+        return f"{self.title}{tag_str}: {self.summary}"
 
 
 class ClusterSummarizer:
     """Handles multi-document summarization using map-reduce approach"""
 
-    def __init__(self, anthropic_client: Anthropic):
+    def __init__(self, anthropic_client: Anthropic, enable_tags: bool = False):
         self.client = anthropic_client
         self.max_content_chars = 3000  # Max chars per doc to send
         self.batch_size = 5  # Number of summaries to combine at once
         self.max_retries = 3
         self.retry_delay = 1.0  # seconds
+        self.enable_tags = enable_tags  # Backwards compatible - tags disabled by default
 
     def summarize_cluster(self, documents: List[Dict[str, str]]) -> ClusterSummary:
         """
@@ -46,10 +50,10 @@ class ClusterSummarizer:
             documents: List of dicts with 'url', 'content', 'title' keys
 
         Returns:
-            ClusterSummary object with title and paragraph-length summary
+            ClusterSummary object with title and paragraph-length summary (and tags if enabled)
         """
         if not documents:
-            return ClusterSummary("Empty Cluster", "No documents in this cluster.", 0, [])
+            return ClusterSummary("Empty Cluster", "No documents in this cluster.", 0, [], [])
 
         urls = [doc['url'] for doc in documents]
 
@@ -65,11 +69,18 @@ class ClusterSummarizer:
         print(f"🏷️  Generating title...")
         title = self._extract_title(final_summary, documents)
 
+        # Extract tags if enabled
+        tags = []
+        if self.enable_tags:
+            print(f"🏷️  Extracting tags...")
+            tags = self._extract_tags(final_summary, documents)
+
         return ClusterSummary(
             title=title,
             summary=final_summary,
             doc_count=len(documents),
-            urls=urls
+            urls=urls,
+            tags=tags
         )
 
     def _map_phase(self, documents: List[Dict[str, str]]) -> List[str]:
@@ -163,6 +174,44 @@ Respond with ONLY the title, nothing else."""
 
         return title
 
+    def _extract_tags(self, final_summary: str, documents: List[Dict[str, str]]) -> List[str]:
+        """Extract relevant tags/keywords for the cluster"""
+
+        # Get a sample of titles and URLs for context
+        sample_titles = [doc['title'] for doc in documents[:5]]
+        sample_urls = [doc['url'] for doc in documents[:5]]
+
+        titles_text = "\n".join(f"- {title}" for title in sample_titles)
+        urls_text = "\n".join(f"- {url}" for url in sample_urls)
+
+        prompt = f"""Based on this summary and sample documents, extract 3-7 relevant tags/keywords that categorize this cluster of web pages.
+
+Summary: {final_summary}
+
+Sample Titles:
+{titles_text}
+
+Sample URLs:
+{urls_text}
+
+Tags should be:
+- Single words or short phrases (1-3 words max each)
+- Descriptive of the topic, domain, or content type
+- Useful for categorization and filtering
+- Examples: "python", "machine learning", "tutorial", "documentation", "news", "AI research", "web development"
+
+Respond with ONLY the tags separated by commas (e.g., "python, tutorial, programming, beginner-friendly")."""
+
+        response = self._call_claude_with_retry(prompt, max_tokens=50)
+
+        # Parse tags from comma-separated response
+        tags = [tag.strip().strip('"\'.,') for tag in response.split(',')]
+
+        # Filter out empty tags and limit to 7 tags
+        tags = [tag for tag in tags if tag][:7]
+
+        return tags
+
     def _call_claude_with_retry(self, prompt: str, max_tokens: int = 100) -> str:
         """Call Claude API with retry logic"""
 
@@ -198,6 +247,11 @@ if __name__ == "__main__":
         exit(1)
 
     client = Anthropic(api_key=api_key)
+
+    # Example 1: Without tags (backwards compatible)
+    print("\n" + "="*60)
+    print("Example 1: Basic summarization (no tags)")
+    print("="*60)
     summarizer = ClusterSummarizer(client)
 
     # Example documents
@@ -219,11 +273,28 @@ if __name__ == "__main__":
         }
     ]
 
-    # Summarize
+    # Summarize without tags
     summary = summarizer.summarize_cluster(documents)
 
     print("\n" + "="*50)
     print(f"Title: {summary.title}")
     print(f"Summary: {summary.summary}")
     print(f"Documents: {summary.doc_count}")
+    print(f"Tags: {summary.tags}")
+    print("="*50)
+
+    # Example 2: With tags enabled
+    print("\n" + "="*60)
+    print("Example 2: Summarization with tags enabled")
+    print("="*60)
+    summarizer_with_tags = ClusterSummarizer(client, enable_tags=True)
+
+    # Summarize with tags
+    summary_with_tags = summarizer_with_tags.summarize_cluster(documents)
+
+    print("\n" + "="*50)
+    print(f"Title: {summary_with_tags.title}")
+    print(f"Summary: {summary_with_tags.summary}")
+    print(f"Documents: {summary_with_tags.doc_count}")
+    print(f"Tags: {summary_with_tags.tags}")
     print("="*50)

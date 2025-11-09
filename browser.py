@@ -14,6 +14,7 @@ import threading
 from cluster_summarizer import ClusterSummarizer
 from cluster_search import ClusterSearcher
 from types import SimpleNamespace
+from spanning_tree import SpanningTreeCalculator, Edge
 
 class GraphView(QWidget):
     """Widget that displays a graph visualization of browser tabs"""
@@ -65,7 +66,11 @@ class GraphView(QWidget):
         except Exception:
             pass
         self.pinch_center = None
-        
+        # MST visualization
+        self.show_mst_only = True
+        self.mst_result = None
+        self.mst_calculator = SpanningTreeCalculator(min_edge_weight=0.2)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -131,16 +136,29 @@ class GraphView(QWidget):
         except Exception:
             self.cluster_map = {}
 
+        # Identify central nodes using MST
+        central_nodes = set()
+        if self.mst_result and self.cluster_map:
+            cluster_central = self.mst_calculator.get_cluster_central_nodes(
+                self.mst_result, self.cluster_map, top_n_per_cluster=1
+            )
+            for cluster_id, nodes_scores in cluster_central.items():
+                if nodes_scores:
+                    central_nodes.add(nodes_scores[0][0])
+
         # Track hovered node for drawing full title on top later
         hovered_node_data = None
 
         for idx, (x, y) in self.node_positions.items():
             tab_data = tabs[idx]
 
+            # Check if this is a central node
+            is_central = idx in central_nodes
+
             # Node appearance based on state
             if idx == self.hovered_node:
                 # Slightly smaller hovered radius while still fitting the title
-                radius = 75; 
+                radius = 75;
                 # Clean blue gradient (hovered) - Chrome-like
                 gradient = QRadialGradient(x, y, radius)
                 gradient.setColorAt(0, QColor(100, 160, 255))
@@ -150,8 +168,8 @@ class GraphView(QWidget):
                 border_color = QColor(66, 133, 244)
                 border_width = 2.5
             else:
-                # Slightly smaller normal radius so inline text still fits
-                radius = 70; 
+                # Central nodes are larger
+                radius = 85 if is_central else 70
                 # Color by cluster if available
                 cluster_id = self.cluster_map.get(idx, None)
                 if cluster_id is not None:
@@ -162,14 +180,24 @@ class GraphView(QWidget):
                 else:
                     base_color = QColor(245, 247, 250)
 
-                # Subtle radial gradient tinted by cluster color
-                gradient = QRadialGradient(x, y, radius)
-                gradient.setColorAt(0, base_color.lighter(120))
-                gradient.setColorAt(0.8, base_color.lighter(105))
-                gradient.setColorAt(1, base_color.darker(110))
-                node_brush = QBrush(gradient)
-                border_color = base_color.darker(120)
-                border_width = 2
+                # Brighter gradient for central nodes
+                if is_central:
+                    gradient = QRadialGradient(x, y, radius)
+                    gradient.setColorAt(0, base_color.lighter(135))
+                    gradient.setColorAt(0.7, base_color.lighter(115))
+                    gradient.setColorAt(1, base_color.darker(105))
+                    node_brush = QBrush(gradient)
+                    border_color = base_color.darker(130)
+                    border_width = 3.5
+                else:
+                    # Subtle radial gradient tinted by cluster color
+                    gradient = QRadialGradient(x, y, radius)
+                    gradient.setColorAt(0, base_color.lighter(120))
+                    gradient.setColorAt(0.8, base_color.lighter(105))
+                    gradient.setColorAt(1, base_color.darker(110))
+                    node_brush = QBrush(gradient)
+                    border_color = base_color.darker(120)
+                    border_width = 2
 
             # Soft shadow (not glow)
             painter.setBrush(QBrush(QColor(0, 0, 0, 20)))
@@ -470,75 +498,104 @@ class GraphView(QWidget):
         if not tab_indices or len(tab_indices) < 2:
             return
 
-        for i, idx1 in enumerate(tab_indices):
-            for idx2 in tab_indices[i+1:]:
-                try:
-                    similarity = self.browser.calculate_similarity(
-                        tabs[idx1]['url'], tabs[idx2]['url']
-                    )
-                except Exception as e:
-                    print(f"[DEBUG] Error calculating similarity: {e}")
-                    similarity = 0.0
+        if self.show_mst_only:
+            # Build edges for MST calculation
+            edges = []
+            for i, idx1 in enumerate(tab_indices):
+                for idx2 in tab_indices[i+1:]:
+                    try:
+                        similarity = self.browser.calculate_similarity(
+                            tabs[idx1]['url'], tabs[idx2]['url']
+                        )
+                    except Exception as e:
+                        similarity = 0.0
 
-                # Draw edge if similarity exceeds threshold
-                if similarity > threshold:
-                    x1, y1 = self.node_positions[idx1]
-                    x2, y2 = self.node_positions[idx2]
+                    if similarity > threshold:
+                        edges.append(Edge(idx1, idx2, similarity))
 
-                    # Weight derived from similarity (0..1)
-                    weight = float(similarity)
+            # Calculate MST
+            self.mst_result = self.mst_calculator.calculate_mst(
+                tab_indices, edges, self.cluster_map
+            )
 
-                    # Smoother thickness scaling - less variation
-                    min_width = 1.5
-                    max_width = 4
-                    thickness = min_width + (max_width - min_width) * weight
+            # Draw only MST edges
+            for edge in self.mst_result.edges:
+                self._draw_edge(painter, edge.node1, edge.node2, edge.weight)
+        else:
+            # Draw all edges above threshold
+            for i, idx1 in enumerate(tab_indices):
+                for idx2 in tab_indices[i+1:]:
+                    try:
+                        similarity = self.browser.calculate_similarity(
+                            tabs[idx1]['url'], tabs[idx2]['url']
+                        )
+                    except Exception as e:
+                        similarity = 0.0
 
-                    # More subtle alpha for less clutter
-                    alpha = int(60 + weight * 100)  # 60-160 range
+                    if similarity > threshold:
+                        self._draw_edge(painter, idx1, idx2, similarity)
 
-                    # Modern browser-inspired blue colors
-                    if self.hovered_node in (idx1, idx2):
-                        # Bright blue when hovered (Chrome blue)
-                        color = QColor(66, 133, 244, alpha + 60)
-                    else:
-                        # Subtle gray-blue for normal edges
-                        color = QColor(128, 134, 139, alpha)
+    def _draw_edge(self, painter, idx1, idx2, weight):
+        """Helper method to draw a single edge between two nodes.
 
-                    # Create curved path instead of straight line
-                    path = QPainterPath()
-                    path.moveTo(x1, y1)
+        painter: QPainter already transformed for pan/zoom
+        idx1, idx2: node indices
+        weight: edge weight (similarity score 0..1)
+        """
+        x1, y1 = self.node_positions[idx1]
+        x2, y2 = self.node_positions[idx2]
 
-                    # Calculate control point for bezier curve
-                    # Offset perpendicular to the line for a gentle curve
-                    mid_x = (x1 + x2) / 2
-                    mid_y = (y1 + y2) / 2
-                    dx = x2 - x1
-                    dy = y2 - y1
-                    dist = math.sqrt(dx*dx + dy*dy)
+        # Smoother thickness scaling - less variation
+        min_width = 1.5
+        max_width = 4
+        thickness = min_width + (max_width - min_width) * weight
 
-                    # Curve amount based on distance (less curve for short distances)
-                    curve_amount = min(50, dist * 0.15)
+        # More subtle alpha for less clutter
+        alpha = int(60 + weight * 100)  # 60-160 range
 
-                    # Perpendicular offset
-                    if dist > 0:
-                        ctrl_x = mid_x - dy / dist * curve_amount
-                        ctrl_y = mid_y + dx / dist * curve_amount
-                    else:
-                        ctrl_x = mid_x
-                        ctrl_y = mid_y
+        # Modern browser-inspired blue colors
+        if self.hovered_node in (idx1, idx2):
+            # Bright blue when hovered (Chrome blue)
+            color = QColor(66, 133, 244, alpha + 60)
+        else:
+            # Subtle gray-blue for normal edges
+            color = QColor(128, 134, 139, alpha)
 
-                    # Draw smooth quadratic bezier curve
-                    path.quadTo(ctrl_x, ctrl_y, x2, y2)
+        # Create curved path instead of straight line
+        path = QPainterPath()
+        path.moveTo(x1, y1)
 
-                    pen = QPen(color, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-                    painter.setPen(pen)
-                    painter.drawPath(path)
+        # Calculate control point for bezier curve
+        # Offset perpendicular to the line for a gentle curve
+        mid_x = (x1 + x2) / 2
+        mid_y = (y1 + y2) / 2
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = math.sqrt(dx*dx + dy*dy)
 
-                    # Only show similarity score on hover
-                    if self.hovered_node in (idx1, idx2):
-                        painter.setFont(QFont('SF Pro Display', 9, QFont.Bold))
-                        painter.setPen(QPen(QColor(66, 133, 244)))
-                        painter.drawText(int(mid_x), int(mid_y - 5), f"{similarity:.2f}")
+        # Curve amount based on distance (less curve for short distances)
+        curve_amount = min(50, dist * 0.15)
+
+        # Perpendicular offset
+        if dist > 0:
+            ctrl_x = mid_x - dy / dist * curve_amount
+            ctrl_y = mid_y + dx / dist * curve_amount
+        else:
+            ctrl_x = mid_x
+            ctrl_y = mid_y
+
+        # Draw smooth quadratic bezier curve
+        path.quadTo(ctrl_x, ctrl_y, x2, y2)
+
+        pen = QPen(color, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+        # Only show similarity score on hover
+        if self.hovered_node in (idx1, idx2):
+            painter.setFont(QFont('SF Pro Display', 9, QFont.Bold))
+            painter.setPen(QPen(QColor(66, 133, 244)))
+            painter.drawText(int(mid_x), int(mid_y - 5), f"{weight:.2f}")
 
     def compute_clusters(self, tabs, tab_indices, threshold=None):
         """Compute clusters as connected components where edge weight >= threshold.
@@ -1218,7 +1275,10 @@ class Browser(QMainWindow):
 
                 # Search input
                 search_edit = QLineEdit()
-                search_edit.setPlaceholderText('Search clusters... (press Enter)')
+                if self.anthropic_client:
+                    search_edit.setPlaceholderText('🔍 AI-powered search... (press Enter)')
+                else:
+                    search_edit.setPlaceholderText('Search clusters... (press Enter)')
                 layout.addWidget(search_edit)
 
                 # Results list
@@ -1264,7 +1324,11 @@ class Browser(QMainWindow):
                         doc_count = len(members)
                         clusters.append(SimpleNamespace(title=title, summary=summary, tags=tags, urls=urls, doc_count=doc_count, cluster_id=cid))
 
-                    searcher = ClusterSearcher()
+                    # Use fuzzy search if Anthropic API is available
+                    if self.anthropic_client:
+                        searcher = ClusterSearcher(anthropic_client=self.anthropic_client, enable_fuzzy=True)
+                    else:
+                        searcher = ClusterSearcher()
                     try:
                         results = searcher.search(clusters, q, min_score=0.0, max_results=50)
                     except Exception:

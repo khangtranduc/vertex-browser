@@ -3,3 +3,4 @@ venv/
 
 # Python cache
 __pycache__/
+.vertex_browser_cache.json

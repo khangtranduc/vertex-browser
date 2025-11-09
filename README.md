@@ -4,13 +4,23 @@ A PyQt5 web browser with AI-powered graph visualization that shows semantic rela
 
 ## Features
 
-- **Graph View**: Force-directed graph showing browser tabs as nodes
-- **AI Similarity**: Uses Claude AI to analyze page content and determine semantic similarity
-- **Interactive**: Drag nodes, zoom, pan, and click to navigate
-- **Physics Simulation**: Tabs with similar content cluster together
+- **Graph View**: Force-directed graph showing browser tabs as nodes with a minimum spanning tree visualization
+- **AI-Powered Similarity**: Uses Claude AI (Haiku) to analyze page content and determine semantic similarity
+- **Smart Clustering**: Automatically groups related tabs into clusters with color coding
+- **Cluster Summaries**: AI-generated titles, descriptions, and tags for each cluster
+- **Cluster Search**: Ctrl+F to search clusters with AI-powered fuzzy matching
+- **Central Nodes**: MST-based centrality highlighting shows the most important pages in each cluster
+- **Interactive**: Drag nodes, zoom, pan, single-click to select clusters, double-click to switch tabs
+- **Physics Simulation**: Tabs with similar content cluster together through force-directed layout
+- **Background Processing**: All AI operations run in background threads for smooth, responsive UI
 
 ## Installation
 
+```bash
+pip install -r requirements.txt
+```
+
+Or manually:
 ```bash
 pip install PyQt5 PyQt5-WebEngine anthropic
 ```
@@ -25,42 +35,57 @@ export ANTHROPIC_API_KEY='your-api-key-here'
 
 ## Running
 
-### Basic Usage
-
 ```bash
 python browser.py
 ```
 
-### Load URLs from File (for Testing/Demos)
+## Usage
 
-```bash
-# Load URLs from a custom file
-python browser.py --urls my_urls.txt
+### Navigation
+- **Ctrl+T**: New tab
+- **Ctrl+G**: Go to graph view
+- **Ctrl+Tab / Ctrl+Shift+Tab**: Switch between tabs
+- **Ctrl+F** (in graph view): Open cluster search
 
-# Load demo URLs (uses demo_urls.txt)
-python browser.py --demo
-```
+### Graph Interactions
+- **Single-click node**: Select cluster and view its summary panel
+- **Double-click node**: Switch to that tab
+- **Left-click + drag node**: Move node manually
+- **Left-click + drag background**: Pan view
+- **Mouse wheel**: Zoom in/out
+- **Hover node**: Show full page title and URL tooltip
+- **Hover node + click red X**: Close tab
 
-**URL File Format:**
-- One URL per line
-- Lines starting with `#` are treated as comments
-- Blank lines are ignored
+### Cluster Information Panel
+When you click a cluster, you'll see:
+- **Cluster title**: AI-generated name describing the cluster's theme
+- **Tags**: Key topics and concepts found in the cluster
+- **Description**: Detailed summary of what the cluster contains
+- **Color indicator**: Matches the node colors in the graph
 
-**Example file:**
-```
-# Python resources
-https://docs.python.org/3/tutorial/
-https://realpython.com/
-
-# Machine Learning
-https://pytorch.org/tutorials/
-https://tensorflow.org/tutorials
-```
+### Search
+Press **Ctrl+F** in graph view to search clusters:
+- Initial results use keyword matching for instant feedback
+- AI-powered fuzzy search runs in background for semantic matches
+- Click a result to jump to that cluster in the graph
 
 ## How It Works
 
-- Open multiple tabs and browse different websites
-- Switch to the "Graph View" tab to see your tabs visualized
-- Tabs are connected by edges whose thickness represents similarity (based on Claude AI analysis)
-- Similar content clusters together through physics simulation
-- Results are cached in `~/.vertex_browser_cache.json` to avoid redundant API calls
+### Graph Visualization
+- Each browser tab appears as a colored node in the graph
+- Nodes are connected by a **minimum spanning tree** that shows the strongest relationships
+- Edge thickness represents semantic similarity strength
+- **Central nodes** (brighter/larger) are identified using MST-based centrality
+
+### AI Processing
+All AI operations run in **background threads** to keep the UI responsive:
+
+1. **Content Extraction**: When a page loads, visible text is extracted via JavaScript
+2. **Similarity Calculation**: Claude AI (Haiku) analyzes pairs of pages to determine semantic similarity
+3. **Clustering**: Pages are grouped using union-find based on similarity threshold
+4. **Summarization**: Each cluster gets AI-generated title, description, and tags
+
+### Caching
+- Similarity scores are cached in `./.vertex_browser_cache.json`
+- Cluster summaries are cached in memory (keyed by URLs, not tab indices)
+- Cache automatically updates when tabs navigate to new pages

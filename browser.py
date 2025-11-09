@@ -1,7 +1,7 @@
 import sys
 import os
 import json
-from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize
+from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
@@ -49,6 +49,10 @@ class GraphView(QWidget):
         self.cluster_threshold = 0.30
         self.cluster_map = {}
         self.cluster_colors = {}
+        # Selection state for clusters
+        self.selected_cluster = None
+        self._panel_rect = None
+        self._close_btn_rect = None
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -234,6 +238,51 @@ class GraphView(QWidget):
 
         # Restore painter state
         painter.restore()
+        # Draw overlay panel for selected cluster (no transform)
+        if self.selected_cluster is not None:
+            panel_width = min(360, max(260, int(self.width() * 0.28)))
+            panel_margin = 16
+            panel_x = self.width() - panel_width - panel_margin
+            panel_y = panel_margin
+            panel_h = self.height() - panel_margin * 2
+            panel_w = panel_width
+
+            # Panel background
+            panel_rect = QRect(panel_x, panel_y, panel_w, panel_h)
+            self._panel_rect = panel_rect
+
+            painter.setPen(QPen(QColor(200, 205, 210), 1))
+            painter.setBrush(QBrush(QColor(255, 255, 255, 250)))
+            painter.drawRoundedRect(panel_rect, 8, 8)
+
+            # Close button at top-right of panel
+            close_r = 12
+            close_x = panel_x + panel_w - close_r - 10
+            close_y = panel_y + 10
+            self._close_btn_rect = QRect(close_x - close_r, close_y - close_r, close_r*2, close_r*2)
+
+            painter.setBrush(QBrush(QColor(230, 80, 80)))
+            painter.setPen(QPen(QColor(200, 40, 40)))
+            painter.drawEllipse(self._close_btn_rect)
+            painter.setPen(QPen(QColor(255, 255, 255), 2))
+            painter.drawLine(close_x - 5, close_y - 5, close_x + 5, close_y + 5)
+            painter.drawLine(close_x + 5, close_y - 5, close_x - 5, close_y + 5)
+
+            # Title and description from external callbacks if provided
+            title = self.get_cluster_title(self.selected_cluster)
+            desc = self.get_cluster_description(self.selected_cluster)
+
+            # Draw title
+            painter.setPen(QPen(QColor(34, 40, 49)))
+            painter.setFont(QFont('SF Pro Display', 12, QFont.Bold))
+            title_rect = QRect(panel_x + 16, panel_y + 20, panel_w - 40, 30)
+            painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, title)
+
+            # Draw description
+            painter.setFont(QFont('SF Pro Display', 10))
+            painter.setPen(QPen(QColor(70, 76, 82)))
+            desc_rect = QRect(panel_x + 16, panel_y + 60, panel_w - 40, panel_h - 80)
+            painter.drawText(desc_rect, Qt.TextWordWrap, desc)
     
     def get_node_at_pos(self, screen_x, screen_y):
         """Get node index at screen position, accounting for zoom and pan"""
@@ -378,6 +427,36 @@ class GraphView(QWidget):
             cluster_map[nid] = cluster_roots[root]
 
         return cluster_map
+
+    def get_cluster_title(self, cluster_id):
+        """Return cluster title by delegating to Browser if available.
+
+        The Browser may implement a `get_cluster_title(cluster_id)` method
+        to provide custom titles. If not present, return a simple fallback.
+        """
+        if cluster_id is None:
+            return ""
+        if hasattr(self.browser, 'get_cluster_title') and callable(self.browser.get_cluster_title):
+            try:
+                return self.browser.get_cluster_title(cluster_id)
+            except Exception:
+                pass
+        return f"Cluster {cluster_id}"
+
+    def get_cluster_description(self, cluster_id):
+        """Return cluster description by delegating to Browser if available.
+
+        Browser can implement `get_cluster_description(cluster_id)` to return
+        a string description. Fallback is an empty placeholder.
+        """
+        if cluster_id is None:
+            return ""
+        if hasattr(self.browser, 'get_cluster_description') and callable(self.browser.get_cluster_description):
+            try:
+                return self.browser.get_cluster_description(cluster_id)
+            except Exception:
+                pass
+        return "(No description available)"
 
     def _physics_tick(self):
         """Timer tick: apply a small physics step and request repaint."""
@@ -602,9 +681,31 @@ class GraphView(QWidget):
     def mouseReleaseEvent(self, event):
         """Handle mouse release"""
         if event.button() == Qt.LeftButton:
-            # If we were on a node and didn't drag, switch to that tab
+            pos = event.pos()
+
+            # If click on panel close button, clear selection
+            try:
+                if self._close_btn_rect is not None and self._close_btn_rect.contains(pos):
+                    self.selected_cluster = None
+                    self.update()
+                    return
+            except Exception:
+                pass
+
+            # If we were on a node and didn't drag, select its cluster (do NOT switch tabs on single click)
             if self.dragging_node is not None and not self.has_dragged:
-                self.browser.tabs.setCurrentIndex(self.dragging_node)
+                node_idx = self.dragging_node
+                # select cluster
+                self.selected_cluster = self.cluster_map.get(node_idx, None)
+                self.update()
+
+            # If we weren't dragging but clicked (quick click on node), select cluster
+            if self.dragging_node is None and not self.has_dragged:
+                node_idx = self.get_node_at_pos(pos.x(), pos.y())
+                if node_idx is not None:
+                    # single click now only selects the cluster; double-click opens the tab
+                    self.selected_cluster = self.cluster_map.get(node_idx, None)
+                    self.update()
 
             self.dragging_node = None
             self.panning = False

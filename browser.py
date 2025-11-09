@@ -274,17 +274,52 @@ class GraphView(QWidget):
             # Title and description from external callbacks if provided
             title = self.get_cluster_title(self.selected_cluster)
             desc = self.get_cluster_description(self.selected_cluster)
-
             # Draw title
             painter.setPen(QPen(QColor(34, 40, 49)))
             painter.setFont(QFont('SF Pro Display', 12, QFont.Bold))
             title_rect = QRect(panel_x + 16, panel_y + 20, panel_w - 40, 30)
             painter.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, title)
 
-            # Draw description
+            # Draw tags (chips) below the title if available
+            tags = []
+            try:
+                tags = self.get_cluster_tags(self.selected_cluster) or []
+            except Exception:
+                tags = []
+
+            tags_height = 0
+            if tags:
+                painter.setFont(QFont('SF Pro Display', 9))
+                fm = painter.fontMetrics()
+                chip_x = panel_x + 16
+                chip_y = panel_y + 52
+                max_x = panel_x + panel_w - 16
+                line_height = fm.height() + 6
+
+                for t in tags[:12]:
+                    text_w = fm.width(t)
+                    chip_w = text_w + 12
+                    if chip_x + chip_w > max_x:
+                        # wrap to next line
+                        chip_x = panel_x + 16
+                        chip_y += line_height + 6
+
+                    chip_rect = QRect(int(chip_x), int(chip_y), int(chip_w), fm.height() + 6)
+                    painter.setBrush(QBrush(QColor(245, 246, 248)))
+                    painter.setPen(QPen(QColor(210, 215, 220)))
+                    painter.drawRoundedRect(chip_rect, 6, 6)
+                    painter.setPen(QPen(QColor(60, 64, 67)))
+                    painter.drawText(chip_rect, Qt.AlignCenter, t)
+
+                    chip_x += chip_w + 8
+
+                tags_height = (chip_y - (panel_y + 52)) + line_height
+
+            # Draw description (positioned below tags area)
             painter.setFont(QFont('SF Pro Display', 10))
             painter.setPen(QPen(QColor(70, 76, 82)))
-            desc_rect = QRect(panel_x + 16, panel_y + 60, panel_w - 40, panel_h - 80)
+            desc_y = panel_y + 60 + max(0, tags_height)
+            desc_rect = QRect(panel_x + 16, desc_y, panel_w - 40, panel_h - (desc_y - panel_y) - 20)
             painter.drawText(desc_rect, Qt.TextWordWrap, desc)
     
     def get_node_at_pos(self, screen_x, screen_y):
@@ -460,6 +495,20 @@ class GraphView(QWidget):
             except Exception:
                 pass
         return "(No description available)"
+
+    def get_cluster_tags(self, cluster_id):
+        """Return cluster tags by delegating to Browser if available.
+
+        Returns a list of tag strings. If unavailable, returns an empty list.
+        """
+        if cluster_id is None:
+            return []
+        if hasattr(self.browser, 'get_cluster_tags') and callable(self.browser.get_cluster_tags):
+            try:
+                return self.browser.get_cluster_tags(cluster_id)
+            except Exception:
+                pass
+        return []
 
     def _physics_tick(self):
         """Timer tick: apply a small physics step and request repaint."""
@@ -902,7 +951,8 @@ class Browser(QMainWindow):
         # Prepare cluster summarizer when API available
         if self.anthropic_client:
             try:
-                self.cluster_summarizer = ClusterSummarizer(self.anthropic_client)
+                # Enable tag extraction so cluster summaries include tags
+                self.cluster_summarizer = ClusterSummarizer(self.anthropic_client, enable_tags=True)
             except Exception as e:
                 print(f"⚠ Could not initialize ClusterSummarizer: {e}")
                 self.cluster_summarizer = None
@@ -996,6 +1046,78 @@ class Browser(QMainWindow):
             future.add_done_callback(_done)
 
         return "Loading..."
+
+    def get_cluster_tags(self, cluster_id):
+        """Return a list of tags for the given cluster id.
+
+        Uses the same asynchronous summarization/caching strategy as the
+        title/description methods. Returns a list when available or an
+        empty list while loading / unavailable.
+        """
+        if cluster_id is None:
+            return []
+
+        try:
+            cluster_map = getattr(self.graph_view, 'cluster_map', {})
+            node_ids = [nid for nid, cid in cluster_map.items() if cid == cluster_id]
+        except Exception:
+            node_ids = []
+
+        if not node_ids:
+            return []
+
+        key = tuple(sorted(node_ids))
+        if key in self._cluster_summary_cache:
+            return list(self._cluster_summary_cache[key].tags or [])
+
+        # Build documents for summarizer
+        docs = []
+        tabs = self.get_web_tabs()
+        for nid in node_ids:
+            td = tabs.get(nid)
+            if not td:
+                continue
+            widget = td.get('widget')
+            content = getattr(widget, 'page_content', '') if widget is not None else ''
+            docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+
+        if not docs or not self.cluster_summarizer:
+            return []
+
+        with self._summary_lock:
+            if key in self._summary_futures:
+                return []
+
+            try:
+                future = self._summary_executor.submit(self.cluster_summarizer.summarize_cluster, docs)
+            except Exception as e:
+                print(f"⚠ Failed to submit summarization task (tags): {e}")
+                return []
+
+            self._summary_futures[key] = future
+
+            def _done(fut, k=key):
+                try:
+                    summary = fut.result()
+                except Exception as ex:
+                    print(f"⚠ Cluster summarization task failed: {ex}")
+                    with self._summary_lock:
+                        self._summary_futures.pop(k, None)
+                    return
+
+                with self._summary_lock:
+                    self._cluster_summary_cache[k] = summary
+                    self._summary_futures.pop(k, None)
+
+                # Schedule UI update on main thread
+                try:
+                    QTimer.singleShot(0, lambda: self.graph_view.update())
+                except Exception:
+                    pass
+
+            future.add_done_callback(_done)
+
+        return []
 
     def get_cluster_description(self, cluster_id):
         """Return a paragraph description for the given cluster id.

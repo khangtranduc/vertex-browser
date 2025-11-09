@@ -137,7 +137,8 @@ class GraphView(QWidget):
 
             # Node appearance based on state
             if idx == self.hovered_node:
-                radius = 88
+                # Slightly smaller hovered radius while still fitting the title
+                radius = 75; 
                 # Clean blue gradient (hovered) - Chrome-like
                 gradient = QRadialGradient(x, y, radius)
                 gradient.setColorAt(0, QColor(100, 160, 255))
@@ -147,7 +148,8 @@ class GraphView(QWidget):
                 border_color = QColor(66, 133, 244)
                 border_width = 2.5
             else:
-                radius = 80
+                # Slightly smaller normal radius so inline text still fits
+                radius = 70; 
                 # Color by cluster if available
                 cluster_id = self.cluster_map.get(idx, None)
                 if cluster_id is not None:
@@ -179,11 +181,13 @@ class GraphView(QWidget):
 
             # Draw favicon in center of node (shift up a bit to leave room for label)
             if 'icon' in tab_data and not tab_data['icon'].isNull():
+                # Scale favicon sizes down to match slightly smaller nodes
                 icon_size = 48 if idx == self.hovered_node else 44
                 pixmap = tab_data['icon'].pixmap(QSize(icon_size, icon_size))
+                # Move favicon up more so the inline label can sit lower inside the node
                 painter.drawPixmap(
                     int(x - icon_size / 2),
-                    int(y - icon_size / 2 - 14),  # Move up to make room for label below
+                    int(y - icon_size / 2 - 16),  # Move up to make room for label below
                     pixmap
                 )
 
@@ -203,8 +207,9 @@ class GraphView(QWidget):
             short_label = label[:12] + '…' if len(label) > 12 else label
             painter.setFont(QFont('SF Pro Display', 9, QFont.Normal))
             painter.setPen(QPen(QColor(60, 64, 67)))
-            txt_rect = painter.boundingRect(0, 0, int(radius * 1.5), 18, Qt.AlignCenter, short_label)
-            txt_rect.moveCenter(QPointF(x, y + radius * 0.45).toPoint())
+            txt_rect = painter.boundingRect(0, 0, int(radius * 1.4), 18, Qt.AlignCenter, short_label)
+            # Position the inline label inside the node (lower than center but still contained)
+            txt_rect.moveCenter(QPointF(x, y + radius * 0.35).toPoint())
             painter.drawText(txt_rect, Qt.AlignCenter, short_label)
 
             # Save full title from web view (for hover overlay)
@@ -229,12 +234,14 @@ class GraphView(QWidget):
             if idx == self.hovered_node:
                 # Place the close button slightly outside the node at the top-right
                 # so it visually sits just outside the circle with a small overlap.
-                # Using an offset factor that, when applied to both axes, positions
-                # the center ~5-8% outside the node radius along the diagonal.
+                # offset factor > 1 would place it further out; 0.75 keeps it near
+                # the edge but slightly outside along the diagonal.
+                # Keep the close button slightly outside the node at the top-right
                 close_btn_offset_factor = 0.75
                 close_btn_x = x + radius * close_btn_offset_factor
                 close_btn_y = y - radius * close_btn_offset_factor
-                close_btn_radius = 9
+                # Slightly smaller close button to match reduced node size
+                close_btn_radius = 14
 
                 # Close button background
                 painter.setBrush(QBrush(QColor(220, 53, 69)))
@@ -243,7 +250,7 @@ class GraphView(QWidget):
 
                 # X symbol (centered in the close button)
                 painter.setPen(QPen(QColor(255, 255, 255), 2))
-                offset = max(3, int(close_btn_radius * 0.45))
+                offset = max(4, int(close_btn_radius * 0.45))
                 painter.drawLine(
                     int(close_btn_x - offset), int(close_btn_y - offset),
                     int(close_btn_x + offset), int(close_btn_y + offset)
@@ -446,7 +453,7 @@ class GraphView(QWidget):
         
         for idx, (x, y) in self.node_positions.items():
             distance = math.sqrt((graph_x - x)**2 + (graph_y - y)**2)
-            if distance <= 92:  # Max node radius (updated for larger nodes)
+            if distance <= 116:  # Max node radius (updated to match larger nodes)
                 return idx
         return None
 

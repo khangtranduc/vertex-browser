@@ -3,11 +3,14 @@ Search and ranking functionality for cluster summaries.
 
 Provides flexible search across cluster titles, summaries, tags, and URLs
 with configurable weighting and ranking algorithms.
+Supports both keyword-based and AI-powered fuzzy semantic search.
 """
 
 from typing import List, Dict, Optional, Tuple
 from cluster_summarizer import ClusterSummary
+from anthropic import Anthropic
 import re
+import time
 
 
 class SearchResult:
@@ -34,7 +37,9 @@ class ClusterSearcher:
         tag_weight: float = 2.5,
         summary_weight: float = 1.5,
         url_weight: float = 1.0,
-        case_sensitive: bool = False
+        case_sensitive: bool = False,
+        anthropic_client: Optional[Anthropic] = None,
+        enable_fuzzy: bool = False
     ):
         """
         Initialize the cluster searcher with configurable weights.
@@ -45,12 +50,17 @@ class ClusterSearcher:
             summary_weight: Weight for matches in summary text (default: 1.5)
             url_weight: Weight for matches in URLs (default: 1.0)
             case_sensitive: Whether search should be case-sensitive (default: False)
+            anthropic_client: Optional Anthropic client for fuzzy search (default: None)
+            enable_fuzzy: Enable AI-powered fuzzy semantic search (default: False)
         """
         self.title_weight = title_weight
         self.tag_weight = tag_weight
         self.summary_weight = summary_weight
         self.url_weight = url_weight
         self.case_sensitive = case_sensitive
+        self.anthropic_client = anthropic_client
+        self.enable_fuzzy = enable_fuzzy and anthropic_client is not None
+        self.fuzzy_cache = {}  # Cache for fuzzy similarity scores
 
     def search(
         self,
@@ -61,6 +71,8 @@ class ClusterSearcher:
     ) -> List[SearchResult]:
         """
         Search clusters and return ranked results.
+
+        Uses fuzzy semantic search if enabled, otherwise uses keyword-based search.
 
         Args:
             clusters: List of ClusterSummary objects to search
@@ -74,17 +86,27 @@ class ClusterSearcher:
         if not query or not clusters:
             return []
 
-        # Prepare query
-        search_query = query if self.case_sensitive else query.lower()
-        query_terms = self._tokenize(search_query)
-
         # Score each cluster
         results = []
-        for cluster in clusters:
-            score, details = self._score_cluster(cluster, search_query, query_terms)
 
-            if score >= min_score:
-                results.append(SearchResult(cluster, score, details))
+        if self.enable_fuzzy:
+            # Use AI-powered fuzzy semantic search
+            print(f"🔍 Performing fuzzy search for: '{query}'")
+            for cluster in clusters:
+                score, details = self._score_cluster_fuzzy(cluster, query)
+
+                if score >= min_score:
+                    results.append(SearchResult(cluster, score, details))
+        else:
+            # Use traditional keyword-based search
+            search_query = query if self.case_sensitive else query.lower()
+            query_terms = self._tokenize(search_query)
+
+            for cluster in clusters:
+                score, details = self._score_cluster(cluster, search_query, query_terms)
+
+                if score >= min_score:
+                    results.append(SearchResult(cluster, score, details))
 
         # Sort by score (descending)
         results.sort(key=lambda r: r.score, reverse=True)
@@ -219,6 +241,141 @@ class ClusterSearcher:
         tokens = [t for t in tokens if len(t) > 1]
 
         return tokens
+
+    def _fuzzy_similarity(self, query: str, text: str) -> float:
+        """
+        Calculate semantic similarity between query and text using Claude AI.
+
+        Returns a score between 0.0 and 1.0 indicating semantic relevance.
+        Uses caching to avoid redundant API calls.
+        """
+        if not self.enable_fuzzy or not self.anthropic_client:
+            return 0.0
+
+        # Create cache key
+        cache_key = f"{query.lower()}||{text[:100].lower()}"
+
+        # Check cache
+        if cache_key in self.fuzzy_cache:
+            return self.fuzzy_cache[cache_key]
+
+        # Truncate text to avoid huge API calls
+        text_truncated = text[:500]
+
+        try:
+            prompt = f"""Analyze the semantic relevance between this search query and text content.
+
+Search Query: "{query}"
+
+Content: "{text_truncated}"
+
+Rate the semantic relevance on a scale from 0.00 to 1.00:
+- 0.00-0.10: Completely unrelated
+- 0.20-0.35: Slightly related (tangential connection)
+- 0.40-0.60: Moderately related (overlapping themes)
+- 0.65-0.80: Closely related (similar topics)
+- 0.85-0.95: Very relevant (directly addresses query)
+- 0.98-1.00: Exact match (perfect relevance)
+
+Consider:
+- Semantic meaning and intent (not just keyword matching)
+- Synonyms and related concepts
+- Topical overlap
+
+Respond with ONLY a decimal number between 0.00 and 1.00 (e.g., 0.73)."""
+
+            message = self.anthropic_client.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=10,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            response_text = message.content[0].text.strip()
+
+            # Extract just the first number (handle cases where AI adds explanations)
+            # Take only the first line and extract the number
+            first_line = response_text.split('\n')[0].strip()
+
+            # Try to extract a decimal number from the first line
+            import re
+            number_match = re.search(r'(\d+\.?\d*)', first_line)
+            if number_match:
+                similarity = float(number_match.group(1))
+            else:
+                similarity = 0.0
+
+            similarity = max(0.0, min(1.0, similarity))
+
+            # Cache the result
+            self.fuzzy_cache[cache_key] = similarity
+
+            # Small delay to avoid rate limiting
+            time.sleep(0.1)
+
+            return similarity
+
+        except Exception as e:
+            print(f"  ⚠ Fuzzy search API error: {e}")
+            return 0.0
+
+    def _score_cluster_fuzzy(
+        self,
+        cluster: ClusterSummary,
+        query: str
+    ) -> Tuple[float, Dict[str, any]]:
+        """
+        Calculate relevance score using AI-powered fuzzy semantic matching.
+
+        Returns:
+            Tuple of (score, match_details)
+        """
+        total_score = 0.0
+        details = {
+            'fuzzy_title_score': 0.0,
+            'fuzzy_summary_score': 0.0,
+            'fuzzy_tags_score': 0.0,
+            'keyword_matches': 0
+        }
+
+        # 1. Fuzzy match on title
+        title_similarity = self._fuzzy_similarity(query, cluster.title)
+        details['fuzzy_title_score'] = title_similarity
+        total_score += title_similarity * self.title_weight * 2.0  # Boost title matches
+
+        # 2. Fuzzy match on summary
+        summary_similarity = self._fuzzy_similarity(query, cluster.summary)
+        details['fuzzy_summary_score'] = summary_similarity
+        total_score += summary_similarity * self.summary_weight * 1.5
+
+        # 3. Fuzzy match on tags (check each tag)
+        if cluster.tags:
+            tags_text = ", ".join(cluster.tags)
+            tags_similarity = self._fuzzy_similarity(query, tags_text)
+            details['fuzzy_tags_score'] = tags_similarity
+            total_score += tags_similarity * self.tag_weight * 2.0
+
+        # 4. Also do keyword matching for exact matches
+        query_lower = query.lower()
+        title_lower = cluster.title.lower()
+        summary_lower = cluster.summary.lower()
+        tags_lower = [tag.lower() for tag in cluster.tags]
+
+        # Count exact keyword matches as bonus
+        keyword_score = 0.0
+        if query_lower in title_lower:
+            keyword_score += 3.0
+            details['keyword_matches'] += 1
+        if query_lower in summary_lower:
+            keyword_score += 1.0
+            details['keyword_matches'] += 1
+        for tag in tags_lower:
+            if query_lower in tag or tag in query_lower:
+                keyword_score += 2.0
+                details['keyword_matches'] += 1
+
+        total_score += keyword_score
+
+        return total_score, details
 
     def search_with_filters(
         self,
@@ -379,3 +536,38 @@ if __name__ == "__main__":
     results = tag_focused_searcher.search(clusters, "python")
     for i, result in enumerate(results, 1):
         print(f"{i}. {result.cluster.title} (Score: {result.score:.3f}) - Tags: {', '.join(result.cluster.tags)}")
+
+    # Example 5: Fuzzy semantic search (requires API key)
+    print("\n" + "="*60)
+    print("Example 5: AI-powered fuzzy semantic search")
+    print("="*60)
+    import os
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+
+    if api_key:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=api_key)
+
+        fuzzy_searcher = ClusterSearcher(
+            anthropic_client=client,
+            enable_fuzzy=True
+        )
+
+        # Search for concepts that might not match keywords exactly
+        # e.g., "AI" should match "Machine Learning" cluster
+        print("\nSearching for 'AI' (should match Machine Learning cluster):")
+        results = fuzzy_searcher.search(clusters, "AI", min_score=1.0)
+        for i, result in enumerate(results, 1):
+            print(f"\n{i}. {result.cluster.title} (Score: {result.score:.3f})")
+            print(f"   Fuzzy scores - Title: {result.match_details.get('fuzzy_title_score', 0):.2f}, "
+                  f"Summary: {result.match_details.get('fuzzy_summary_score', 0):.2f}, "
+                  f"Tags: {result.match_details.get('fuzzy_tags_score', 0):.2f}")
+            print(f"   Keyword matches: {result.match_details.get('keyword_matches', 0)}")
+
+        # Try another fuzzy search
+        print("\nSearching for 'coding tutorials' (semantic search):")
+        results = fuzzy_searcher.search(clusters, "coding tutorials", min_score=1.0)
+        for i, result in enumerate(results, 1):
+            print(f"{i}. {result.cluster.title} (Score: {result.score:.3f})")
+    else:
+        print("\nSkipping fuzzy search example (ANTHROPIC_API_KEY not set)")

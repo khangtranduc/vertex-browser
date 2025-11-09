@@ -1980,94 +1980,102 @@ class Browser(QMainWindow):
         if not self.cluster_summarizer:
             return  # No summarizer available
 
-        try:
-            tabs = self.get_web_tabs()
-            tab_indices = list(tabs.keys())
-
-            if len(tab_indices) < 2:
-                return
-
-            # Compute clusters and update graph_view's cluster_map
-            cluster_map = {}
+        # Run clustering and summarization entirely in background thread
+        def background_task():
             try:
-                cluster_map = self.graph_view.compute_clusters(tabs, tab_indices, threshold=self.graph_view.cluster_threshold)
-                # Store the cluster map on main thread
-                QTimer.singleShot(0, lambda cm=cluster_map: setattr(self.graph_view, 'cluster_map', cm))
-            except Exception as e:
-                print(f"⚠ Error computing clusters: {e}")
-                return
+                tabs = self.get_web_tabs()
+                tab_indices = list(tabs.keys())
 
-            # Group nodes by cluster
-            groups = {}
-            for nid, cid in cluster_map.items():
-                groups.setdefault(cid, []).append(nid)
+                if len(tab_indices) < 2:
+                    return
 
-            # For each cluster, directly submit summarization tasks
-            for cid, members in groups.items():
-                node_ids = sorted(members)
-                key = tuple(node_ids)
+                # Compute clusters (this may call calculate_similarity which can block)
+                cluster_map = {}
+                try:
+                    cluster_map = self.graph_view.compute_clusters(tabs, tab_indices, threshold=self.graph_view.cluster_threshold)
+                    # Store the cluster map on main thread
+                    QTimer.singleShot(0, lambda cm=cluster_map: setattr(self.graph_view, 'cluster_map', cm))
+                except Exception as e:
+                    print(f"⚠ Error computing clusters: {e}")
+                    return
 
-                # Skip if already cached or being computed
-                with self._summary_lock:
-                    if key in self._cluster_summary_cache or key in self._summary_futures:
+                # Group nodes by cluster
+                groups = {}
+                for nid, cid in cluster_map.items():
+                    groups.setdefault(cid, []).append(nid)
+
+                # For each cluster, directly submit summarization tasks
+                for cid, members in groups.items():
+                    node_ids = sorted(members)
+                    key = tuple(node_ids)
+
+                    # Skip if already cached or being computed
+                    with self._summary_lock:
+                        if key in self._cluster_summary_cache or key in self._summary_futures:
+                            continue
+
+                    # Build documents for this cluster
+                    docs = []
+                    for nid in node_ids:
+                        td = tabs.get(nid)
+                        if not td:
+                            continue
+                        widget = td.get('widget')
+                        content = getattr(widget, 'page_content', '') if widget is not None else ''
+                        docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+
+                    if not docs:
                         continue
 
-                # Build documents for this cluster
-                docs = []
-                for nid in node_ids:
-                    td = tabs.get(nid)
-                    if not td:
-                        continue
-                    widget = td.get('widget')
-                    content = getattr(widget, 'page_content', '') if widget is not None else ''
-                    docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+                    # Submit background summarization job
+                    with self._summary_lock:
+                        try:
+                            print(f"📝 Starting summarization for cluster {cid} ({len(docs)} pages)")
+                            future = self._summary_executor.submit(self.cluster_summarizer.summarize_cluster, docs)
+                            self._summary_futures[key] = future
 
-                if not docs:
-                    continue
+                            # Attach done callback
+                            def _done(fut, k=key):
+                                try:
+                                    summary = fut.result()
+                                except Exception as ex:
+                                    print(f"⚠ Cluster summarization task failed: {ex}")
+                                    with self._summary_lock:
+                                        self._summary_futures.pop(k, None)
+                                    return
 
-                # Submit background summarization job
-                with self._summary_lock:
-                    try:
-                        print(f"📝 Starting summarization for cluster {cid} ({len(docs)} pages)")
-                        future = self._summary_executor.submit(self.cluster_summarizer.summarize_cluster, docs)
-                        self._summary_futures[key] = future
-
-                        # Attach done callback
-                        def _done(fut, k=key):
-                            try:
-                                summary = fut.result()
-                            except Exception as ex:
-                                print(f"⚠ Cluster summarization task failed: {ex}")
                                 with self._summary_lock:
+                                    self._cluster_summary_cache[k] = summary
                                     self._summary_futures.pop(k, None)
-                                return
 
-                            with self._summary_lock:
-                                self._cluster_summary_cache[k] = summary
-                                self._summary_futures.pop(k, None)
+                                print(f"✓ Cluster summary completed for {len(k)} pages")
 
-                            print(f"✓ Cluster summary completed for {len(k)} pages")
+                                # Schedule UI update on main thread using the application instance
+                                # This ensures it runs on the main thread's event loop
+                                try:
+                                    app = QApplication.instance()
+                                    if app:
+                                        # Use invokeMethod to safely call from background thread
+                                        from PyQt5.QtCore import QMetaObject, Q_ARG
+                                        QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
+                                        # Also refresh search panel if open
+                                        QMetaObject.invokeMethod(self, "_refresh_search_panel", Qt.QueuedConnection)
+                                except Exception as e:
+                                    print(f"⚠ Error scheduling UI update: {e}")
 
-                            # Schedule UI update on main thread using the application instance
-                            # This ensures it runs on the main thread's event loop
-                            try:
-                                app = QApplication.instance()
-                                if app:
-                                    # Use invokeMethod to safely call from background thread
-                                    from PyQt5.QtCore import QMetaObject, Q_ARG
-                                    QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
-                                    # Also refresh search panel if open
-                                    QMetaObject.invokeMethod(self, "_refresh_search_panel", Qt.QueuedConnection)
-                            except Exception as e:
-                                print(f"⚠ Error scheduling UI update: {e}")
+                            future.add_done_callback(_done)
+                        except Exception as e:
+                            print(f"⚠ Failed to submit summarization task: {e}")
 
-                        future.add_done_callback(_done)
-                    except Exception as e:
-                        print(f"⚠ Failed to submit summarization task: {e}")
+                print(f"🔄 Started background summarization for {len(groups)} clusters")
+            except Exception as e:
+                print(f"⚠ Error in background_task: {e}")
 
-            print(f"🔄 Started background summarization for {len(groups)} clusters")
+        # Submit the entire clustering+summarization task to background thread
+        try:
+            self._summary_executor.submit(background_task)
         except Exception as e:
-            print(f"⚠ Error in precalculate_cluster_summaries: {e}")
+            print(f"⚠ Failed to submit background clustering task: {e}")
 
     def on_tab_changed(self, idx):
         """Handle tab changes"""

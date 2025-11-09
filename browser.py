@@ -1132,7 +1132,7 @@ class Browser(QMainWindow):
         # Cache for similarity scores (url1-url2 -> score)
         self.similarity_cache = {}
         # Cache file for persistent storage
-        self.cache_file = os.path.expanduser('~/.vertex_browser_cache.json')
+        self.cache_file = os.path.expanduser('./.vertex_browser_cache.json')
         self._load_similarity_cache()
 
         # Cache for cluster summaries: frozenset(node ids) -> ClusterSummary

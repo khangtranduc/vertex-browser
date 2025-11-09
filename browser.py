@@ -1,7 +1,7 @@
 import sys
 import os
 import json
-from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect
+from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect, QEvent
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
@@ -40,7 +40,7 @@ class GraphView(QWidget):
         self.attraction_strength = 0.5  # Gentler attraction
         self.repulsion_strength = 1500.0  # Less aggressive repulsion
         # Separation to keep comfortable distances (pixels)
-        self.min_separation = 100.0  # More breathing room
+        self.min_separation = 220.0  # More breathing room for larger nodes
         self.separation_strength = 6.0
         self.damping = 0.90  # Higher damping for smoother settling
 
@@ -56,6 +56,13 @@ class GraphView(QWidget):
         self.selected_cluster = None
         self._panel_rect = None
         self._close_btn_rect = None
+        # Gesture state for pinch-to-zoom
+        try:
+            # enable pinch gesture if supported
+            self.grabGesture(Qt.PinchGesture)
+        except Exception:
+            pass
+        self.pinch_center = None
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -112,6 +119,9 @@ class GraphView(QWidget):
         # Draw edges (connections between tabs)
         self.draw_edges(painter, tabs, tab_indices)
         
+        # Clear close button positions from previous frame
+        self.close_button_positions = {}
+
         # Draw nodes
         # Compute clustering based on current similarities
         try:
@@ -119,12 +129,15 @@ class GraphView(QWidget):
         except Exception:
             self.cluster_map = {}
 
+        # Track hovered node for drawing full title on top later
+        hovered_node_data = None
+
         for idx, (x, y) in self.node_positions.items():
             tab_data = tabs[idx]
 
             # Node appearance based on state
             if idx == self.hovered_node:
-                radius = 35
+                radius = 75
                 # Clean blue gradient (hovered) - Chrome-like
                 gradient = QRadialGradient(x, y, radius)
                 gradient.setColorAt(0, QColor(100, 160, 255))
@@ -134,7 +147,7 @@ class GraphView(QWidget):
                 border_color = QColor(66, 133, 244)
                 border_width = 2.5
             else:
-                radius = 32
+                radius = 70
                 # Color by cluster if available
                 cluster_id = self.cluster_map.get(idx, None)
                 if cluster_id is not None:
@@ -164,32 +177,35 @@ class GraphView(QWidget):
             painter.setPen(QPen(border_color, border_width))
             painter.drawEllipse(QPointF(x, y), radius, radius)
 
-            # Draw favicon in center of node
+            # Draw favicon in center of node (shift up a bit to leave room for title)
             if 'icon' in tab_data and not tab_data['icon'].isNull():
-                icon_size = 20 if idx == self.hovered_node else 18
+                icon_size = 40 if idx == self.hovered_node else 36
                 pixmap = tab_data['icon'].pixmap(QSize(icon_size, icon_size))
                 painter.drawPixmap(
                     int(x - icon_size / 2),
-                    int(y - icon_size / 2),
+                    int(y - icon_size / 2 - 12),  # Move up to make room for title below
                     pixmap
                 )
 
-            # Tab title
-            painter.setFont(QFont('SF Pro Display', 10, QFont.Normal))
-            title = tab_data['title'][:25] + '...' if len(tab_data['title']) > 25 else tab_data['title']
-
-            # Draw title below node
-            text_rect = painter.boundingRect(0, 0, 250, 50, Qt.AlignCenter, title)
-            text_rect.moveCenter(QPointF(x, y + radius + 20).toPoint())
-
-            # Clean white background for text
-            painter.setBrush(QBrush(QColor(255, 255, 255, 240)))
-            painter.setPen(QPen(QColor(220, 225, 230), 1))
-            painter.drawRoundedRect(text_rect.adjusted(-8, -3, 8, 3), 6, 6)
-
-            # Dark gray text
-            painter.setPen(QPen(QColor(60, 64, 67)))
-            painter.drawText(text_rect, Qt.AlignCenter, title)
+            # Tab title - draw inside the node below the icon (truncated when not hovered)
+            painter.setFont(QFont('SF Pro Display', 14, QFont.Normal))
+            full_title = tab_data['title']
+            if idx != self.hovered_node:
+                title = full_title[:15] + '...' if len(full_title) > 15 else full_title
+                # Normal constrained space when not hovering
+                text_rect = painter.boundingRect(0, 0, radius * 2 - 20, 60, Qt.AlignCenter | Qt.TextWordWrap, title)
+                text_rect.moveCenter(QPointF(x, y + 25).toPoint())
+                # Dark gray text for better contrast
+                painter.setPen(QPen(QColor(60, 64, 67)))
+                painter.drawText(text_rect, Qt.AlignCenter | Qt.TextWordWrap, title)
+            else:
+                # Save hovered node data to render full title on top later
+                hovered_node_data = {
+                    'x': x,
+                    'y': y,
+                    'radius': radius,
+                    'title': full_title
+                }
 
             # Draw close button when hovered
             if idx == self.hovered_node:
@@ -215,8 +231,6 @@ class GraphView(QWidget):
                 )
 
                 # Store close button position for click detection
-                if not hasattr(self, 'close_button_positions'):
-                    self.close_button_positions = {}
                 self.close_button_positions[idx] = (close_btn_x, close_btn_y, close_btn_radius)
 
                 # Show URL tooltip on hover
@@ -238,6 +252,70 @@ class GraphView(QWidget):
                 # Tooltip text
                 painter.setPen(QPen(QColor(240, 245, 250)))
                 painter.drawText(tooltip_rect, Qt.AlignCenter, url)
+
+        # Draw hovered node's full title on top of everything (inside transformed coordinates)
+        if hovered_node_data:
+            from PyQt5.QtCore import QRectF
+            from PyQt5.QtGui import QTextDocument
+
+            x = hovered_node_data['x']
+            y = hovered_node_data['y']
+            radius = hovered_node_data['radius']
+            full_title = hovered_node_data['title']
+
+            font = QFont('SF Pro Display', 14, QFont.Bold)
+            painter.setFont(font)
+
+            # Use QTextDocument for proper text layout with word wrapping
+            max_width = 400
+            doc = QTextDocument()
+            doc.setDefaultFont(font)
+
+            # Set HTML with color styling to ensure text is visible
+            html_text = f'<div style="color: rgb(60, 64, 67); text-align: center;">{full_title}</div>'
+            doc.setHtml(html_text)
+
+            # First measure without width constraint to get natural width
+            doc.setTextWidth(-1)  # No width constraint
+            natural_size = doc.size()
+            natural_width = natural_size.width()
+
+            # If natural width exceeds max, constrain and allow wrapping
+            if natural_width > max_width:
+                doc.setTextWidth(max_width)
+                text_size = doc.size()
+                text_width = text_size.width()
+                text_height = text_size.height()
+            else:
+                # Use natural width (no wrapping needed)
+                text_width = natural_width
+                text_height = natural_size.height()
+
+            # Create rect for the text, centered below the node
+            text_rect = QRectF(
+                x - text_width / 2,
+                y + 25 - text_height / 2,
+                text_width,
+                text_height
+            )
+
+            # Draw white background box for full title with shadow
+            # Draw shadow first
+            painter.setBrush(QBrush(QColor(0, 0, 0, 40)))
+            painter.setPen(QPen(Qt.NoPen))
+            painter.drawRoundedRect(text_rect.adjusted(-8, -3, 14, 9), 8, 8)
+
+            # Draw white background box for full title
+            painter.setBrush(QBrush(QColor(255, 255, 255, 250)))
+            painter.setPen(QPen(QColor(66, 133, 244), 2))
+            painter.drawRoundedRect(text_rect.adjusted(-10, -5, 10, 5), 8, 8)
+
+            # Draw full title text using the document
+            painter.setPen(QPen(QColor(60, 64, 67)))
+            painter.save()
+            painter.translate(text_rect.topLeft())
+            doc.drawContents(painter)
+            painter.restore()
 
         # Restore painter state
         painter.restore()
@@ -330,7 +408,7 @@ class GraphView(QWidget):
         
         for idx, (x, y) in self.node_positions.items():
             distance = math.sqrt((graph_x - x)**2 + (graph_y - y)**2)
-            if distance <= 35:  # Max node radius
+            if distance <= 75:  # Max node radius (updated for larger nodes)
                 return idx
         return None
 
@@ -792,6 +870,51 @@ class GraphView(QWidget):
         self.offset_y = mouse_y - (mouse_y - self.offset_y) * zoom_change
         
         self.update()
+
+    def event(self, event):
+        """Handle gesture events for pinch-to-zoom"""
+        if event.type() == QEvent.Gesture:
+            return self.gestureEvent(event)
+        return super().event(event)
+
+    def gestureEvent(self, event):
+        """Handle pinch gesture for zooming"""
+        gesture = event.gesture(Qt.PinchGesture)
+        if gesture:
+            return self.pinchGesture(gesture)
+        return False
+
+    def pinchGesture(self, gesture):
+        """Handle pinch-to-zoom gesture"""
+        if gesture.state() == Qt.GestureStarted:
+            # Store the center point when pinch starts
+            self.pinch_center = gesture.centerPoint()
+
+        elif gesture.state() == Qt.GestureUpdated:
+            # Get the scale factor from the gesture
+            scale_factor = gesture.scaleFactor()
+
+            # Get center point of the pinch
+            center = gesture.centerPoint()
+            center_x = center.x()
+            center_y = center.y()
+
+            # Apply zoom
+            old_zoom = self.zoom
+            self.zoom *= scale_factor
+            self.zoom = max(0.3, min(3.0, self.zoom))
+
+            # Adjust offset to zoom towards pinch center
+            zoom_change = self.zoom / old_zoom
+            self.offset_x = center_x - (center_x - self.offset_x) * zoom_change
+            self.offset_y = center_y - (center_y - self.offset_y) * zoom_change
+
+            self.update()
+
+        elif gesture.state() == Qt.GestureFinished:
+            self.pinch_center = None
+
+        return True
 
 
 class BrowserTab(QWidget):

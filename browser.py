@@ -1,7 +1,9 @@
 import sys
 import os
 import json
-from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize
+import threading
+import queue
+from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, pyqtSignal, QObject
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
@@ -9,6 +11,108 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView
 import math
 import random
 from anthropic import Anthropic
+
+
+class SimilarityWorker(QObject):
+    """Worker that calculates similarities in background thread"""
+    similarity_calculated = pyqtSignal(str, str, float)  # url1, url2, similarity
+
+    def __init__(self, anthropic_client):
+        super().__init__()
+        self.anthropic_client = anthropic_client
+        self.queue = queue.Queue()
+        self.running = True
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.thread.start()
+
+    def calculate_async(self, url1, url2, content1, content2):
+        """Queue a similarity calculation"""
+        self.queue.put((url1, url2, content1, content2))
+
+    def _worker_loop(self):
+        """Background thread that processes similarity calculations"""
+        while self.running:
+            try:
+                item = self.queue.get(timeout=0.5)
+                if item is None:
+                    continue
+
+                url1, url2, content1, content2 = item
+                similarity = self._calculate_similarity_sync(url1, url2, content1, content2)
+
+                # Emit signal with result
+                self.similarity_calculated.emit(url1, url2, similarity)
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"⚠ Error in similarity worker: {e}")
+
+    def _calculate_similarity_sync(self, url1, url2, content1, content2):
+        """Synchronous similarity calculation (runs in background thread)"""
+        if not content1 or not content2:
+            return 0.0
+
+        if not self.anthropic_client:
+            return random.random()
+
+        try:
+            prompt = f"""You are analyzing the semantic similarity between two web pages. Provide a precise similarity score.
+
+Page 1 URL: {url1}
+Page 1 Content:
+{content1[:3000]}
+
+Page 2 URL: {url2}
+Page 2 Content:
+{content2[:3000]}
+
+Analyze how similar these pages are based on:
+- Topic and subject matter (most important)
+- Content type (article, documentation, shopping, social media, etc.)
+- Domain/category (news, tech, sports, finance, etc.)
+
+Respond with ONLY a decimal number between 0.00 and 1.00 (use 2 decimal places for precision):
+- 0.00-0.10 = completely unrelated topics
+- 0.20-0.35 = tangentially related (same broad category)
+- 0.40-0.60 = moderately related (overlapping themes)
+- 0.65-0.80 = closely related (similar topics)
+- 0.85-0.95 = very similar (same specific topic)
+- 0.98-1.00 = nearly identical content
+
+Be precise and use the full range. Respond with ONLY the number (e.g., 0.73)."""
+
+            message = self.anthropic_client.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=10,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            response_text = message.content[0].text.strip()
+            first_line = response_text.split('\n')[0].strip()
+            similarity = float(first_line)
+            similarity = max(0.0, min(1.0, similarity))
+
+            print(f"✓ Similarity: {similarity:.2f} - {url1[:40]}... ↔ {url2[:40]}...")
+            return similarity
+
+        except Exception as e:
+            print(f"⚠ Error calculating similarity: {e}")
+            # Fallback to domain comparison
+            try:
+                from PyQt5.QtCore import QUrl as QUrlParser
+                domain1 = QUrlParser(url1).host()
+                domain2 = QUrlParser(url2).host()
+                if domain1 == domain2:
+                    return 0.7
+                return 0.1
+            except:
+                return 0.1
+
+    def stop(self):
+        """Stop the worker thread"""
+        self.running = False
+
 
 class GraphView(QWidget):
     """Widget that displays a graph visualization of browser tabs"""
@@ -658,9 +762,9 @@ class BrowserTab(QWidget):
             else:
                 self.page_content = ""
             self.content_extraction_pending = False
-            # Trigger graph update after content is extracted
+            # Trigger similarity calculations in background
             if hasattr(self, 'browser_parent') and self.browser_parent:
-                self.browser_parent.update_graph()
+                self.browser_parent.trigger_similarity_calculations()
 
         self.web_view.page().runJavaScript(js_code, handle_content)
 
@@ -729,6 +833,12 @@ class Browser(QMainWindow):
         # Cache file for persistent storage
         self.cache_file = os.path.expanduser('~/.vertex_browser_cache.json')
         self._load_similarity_cache()
+
+        # Initialize similarity worker for background calculations
+        self.similarity_worker = SimilarityWorker(self.anthropic_client)
+        self.similarity_worker.similarity_calculated.connect(self._on_similarity_calculated)
+        # Track pending calculations to avoid duplicates
+        self.pending_calculations = set()
     
     def add_new_tab(self, url='https://www.google.com'):
         """Add a new browser tab"""
@@ -815,99 +925,52 @@ class Browser(QMainWindow):
                 }
         return tabs
     
+    def _on_similarity_calculated(self, url1, url2, similarity):
+        """Callback when background similarity calculation completes"""
+        cache_key = f"{min(url1, url2)}||{max(url1, url2)}"
+        self.similarity_cache[cache_key] = similarity
+        self._save_similarity_cache()
+        self.pending_calculations.discard(cache_key)
+        # Trigger graph update (only if graph view is visible)
+        if self.tabs.currentIndex() == self.graph_tab_index:
+            self.update_graph()
+
+    def trigger_similarity_calculations(self):
+        """Proactively calculate similarities for all tab pairs"""
+        tabs = self.get_web_tabs()
+        tab_list = list(tabs.items())
+
+        for i, (idx1, data1) in enumerate(tab_list):
+            for idx2, data2 in tab_list[i+1:]:
+                url1 = data1['url']
+                url2 = data2['url']
+                cache_key = f"{min(url1, url2)}||{max(url1, url2)}"
+
+                # Skip if already cached or pending
+                if cache_key in self.similarity_cache or cache_key in self.pending_calculations:
+                    continue
+
+                content1 = data1['content']
+                content2 = data2['content']
+
+                # Only calculate if both have content
+                if content1 and content2:
+                    self.pending_calculations.add(cache_key)
+                    self.similarity_worker.calculate_async(url1, url2, content1, content2)
+
     def calculate_similarity(self, url1, url2):
         """
-        Calculate similarity between two tabs using Claude AI to analyze
-        page content. Returns a float between 0.0 and 1.0.
+        Get cached similarity between two tabs.
+        Returns a float between 0.0 and 1.0.
+
+        Note: Similarity is calculated proactively in background when
+        page content is extracted, not on-demand here.
         """
         # Create a cache key (ensure consistent ordering)
         cache_key = f"{min(url1, url2)}||{max(url1, url2)}"
 
-        # Check cache first
-        if cache_key in self.similarity_cache:
-            return self.similarity_cache[cache_key]
-
-        # If no API client, fall back to random similarity
-        if not self.anthropic_client:
-            score = random.random()
-            self.similarity_cache[cache_key] = score
-            return score
-
-        # Get tab content for both URLs
-        tabs = self.get_web_tabs()
-        content1 = None
-        content2 = None
-
-        for tab_data in tabs.values():
-            if tab_data['url'] == url1:
-                content1 = tab_data['content']
-            if tab_data['url'] == url2:
-                content2 = tab_data['content']
-
-        # If either page has no content yet, cache and return low similarity
-        if not content1 or not content2:
-            # Cache the low result to prevent repeated checks
-            self.similarity_cache[cache_key] = 0.0
-            return 0.0
-
-        try:
-            # Use Claude to analyze similarity
-            prompt = f"""You are analyzing the semantic similarity between two web pages. Provide a precise similarity score.
-
-Page 1 URL: {url1}
-Page 1 Content:
-{content1[:3000]}
-
-Page 2 URL: {url2}
-Page 2 Content:
-{content2[:3000]}
-
-Analyze how similar these pages are based on:
-- Topic and subject matter (most important)
-- Content type (article, documentation, shopping, social media, etc.)
-- Domain/category (news, tech, sports, finance, etc.)
-
-Respond with ONLY a decimal number between 0.00 and 1.00 (use 2 decimal places for precision):
-- 0.00-0.10 = completely unrelated topics
-- 0.20-0.35 = tangentially related (same broad category)
-- 0.40-0.60 = moderately related (overlapping themes)
-- 0.65-0.80 = closely related (similar topics)
-- 0.85-0.95 = very similar (same specific topic)
-- 0.98-1.00 = nearly identical content
-
-Be precise and use the full range. Respond with ONLY the number (e.g., 0.73)."""
-
-            message = self.anthropic_client.messages.create(
-                model="claude-3-5-haiku-20241022",  # Fast and cost-effective
-                max_tokens=10,
-                messages=[{"role": "user", "content": prompt}]
-            )
-
-            # Parse the response - extract just the number
-            response_text = message.content[0].text.strip()
-            # Take only the first line and extract the number
-            first_line = response_text.split('\n')[0].strip()
-            similarity = float(first_line)
-            similarity = max(0.0, min(1.0, similarity))  # Clamp to [0, 1]
-
-            # Cache the result
-            self.similarity_cache[cache_key] = similarity
-            self._save_similarity_cache()
-
-            print(f"✓ Similarity: {similarity:.2f} - {url1[:40]}... ↔ {url2[:40]}...")
-            return similarity
-
-        except Exception as e:
-            print(f"⚠ Error calculating similarity: {e}")
-            # Fall back to basic domain comparison
-            try:
-                domain1 = QUrl(url1).host()
-                domain2 = QUrl(url2).host()
-                if domain1 == domain2:
-                    return 0.7
-                return 0.1
-            except:
-                return 0.1
+        # Return cached value, or 0 if not yet calculated
+        return self.similarity_cache.get(cache_key, 0.0)
     
     def update_graph(self):
         """Update the graph view"""

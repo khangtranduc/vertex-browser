@@ -1128,8 +1128,10 @@ class BrowserTab(QWidget):
             # Trigger graph update after content is extracted
             if hasattr(self, 'browser_parent') and self.browser_parent:
                 self.browser_parent.update_graph()
-                # Pre-calculate similarities in background
-                self.browser_parent.precalculate_similarities()
+                # Pre-calculate similarities in background (with delay to avoid blocking)
+                QTimer.singleShot(500, lambda: self.browser_parent.precalculate_similarities())
+                # Pre-generate cluster summaries in background (with delay)
+                QTimer.singleShot(1000, lambda: self.browser_parent.precalculate_cluster_summaries())
 
         self.web_view.page().runJavaScript(js_code, handle_content)
 
@@ -1336,6 +1338,8 @@ class Browser(QMainWindow):
                 # Store widgets for reuse
                 panel._search_edit = search_edit
                 panel._results_list = results_list
+                panel._current_query = None
+                panel._current_clusters = None
 
                 # Perform search when user presses Enter
                 def do_search():
@@ -1365,6 +1369,10 @@ class Browser(QMainWindow):
                         urls = [tabs.get(nid, {}).get('url', '') for nid in members]
                         doc_count = len(members)
                         clusters.append(SimpleNamespace(title=title, summary=summary, tags=tags, urls=urls, doc_count=doc_count, cluster_id=cid))
+
+                    # Store current search context for re-running when descriptions update
+                    panel._current_query = q
+                    panel._current_clusters = clusters
 
                     # STEP 1: Show keyword-based results immediately
                     keyword_searcher = ClusterSearcher()  # No fuzzy search
@@ -1525,15 +1533,72 @@ class Browser(QMainWindow):
                     self._cluster_summary_cache[k] = summary
                     self._summary_futures.pop(k, None)
 
-                # Schedule UI update on main thread
+                # Schedule UI update on main thread using thread-safe method
                 try:
-                    QTimer.singleShot(0, lambda: self.graph_view.update())
-                except Exception:
-                    pass
+                    app = QApplication.instance()
+                    if app:
+                        # Use invokeMethod to safely call from background thread
+                        QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
+                except Exception as e:
+                    print(f"⚠ Error scheduling UI update: {e}")
 
             future.add_done_callback(_done)
 
         return "Loading..."
+
+    def _refresh_search_panel(self):
+        """Refresh search panel with updated cluster descriptions"""
+        try:
+            if self._cluster_search_panel is None or not self._cluster_search_panel.isVisible():
+                return
+
+            panel = self._cluster_search_panel
+            if not hasattr(panel, '_current_query') or panel._current_query is None:
+                return
+
+            q = panel._current_query
+
+            # Re-build clusters with updated descriptions
+            tabs = self.get_web_tabs()
+            tab_indices = list(tabs.keys())
+            cluster_map = {}
+            try:
+                cluster_map = self.graph_view.compute_clusters(tabs, tab_indices, threshold=self.graph_view.cluster_threshold)
+            except Exception:
+                return
+
+            groups = {}
+            for nid, cid in cluster_map.items():
+                groups.setdefault(cid, []).append(nid)
+
+            clusters = []
+            for cid, members in groups.items():
+                title = self.get_cluster_title(cid)
+                summary = self.get_cluster_description(cid)
+                tags = self.get_cluster_tags(cid) or []
+                urls = [tabs.get(nid, {}).get('url', '') for nid in members]
+                doc_count = len(members)
+                clusters.append(SimpleNamespace(title=title, summary=summary, tags=tags, urls=urls, doc_count=doc_count, cluster_id=cid))
+
+            # Only update if descriptions have changed (not still "Loading...")
+            if any(c.summary != "Loading..." for c in clusters):
+                # Re-run keyword search with updated descriptions
+                keyword_searcher = ClusterSearcher()
+                try:
+                    keyword_results = keyword_searcher.search(clusters, q, min_score=0.0, max_results=50)
+
+                    # Update list if we have results
+                    if keyword_results:
+                        panel._results_list.clear()
+                        for res in keyword_results:
+                            item = QListWidgetItem(f"{res.cluster.title} — score {res.score:.2f}")
+                            item.setData(Qt.UserRole, getattr(res.cluster, 'cluster_id', None))
+                            item.setToolTip((res.cluster.summary or '')[:400])
+                            panel._results_list.addItem(item)
+                except Exception as e:
+                    print(f"⚠ Search panel refresh error: {e}")
+        except Exception as e:
+            print(f"⚠ _refresh_search_panel error: {e}")
 
     def get_cluster_tags(self, cluster_id):
         """Return a list of tags for the given cluster id.
@@ -1895,6 +1960,98 @@ class Browser(QMainWindow):
                         self._summary_executor.submit(calculate_pair, idx1, idx2)
                     except Exception:
                         pass  # Executor might be full, that's OK
+
+    def precalculate_cluster_summaries(self):
+        """Pre-generate cluster summaries in background"""
+        if not self.cluster_summarizer:
+            return  # No summarizer available
+
+        try:
+            tabs = self.get_web_tabs()
+            tab_indices = list(tabs.keys())
+
+            if len(tab_indices) < 2:
+                return
+
+            # Compute clusters and update graph_view's cluster_map
+            cluster_map = {}
+            try:
+                cluster_map = self.graph_view.compute_clusters(tabs, tab_indices, threshold=self.graph_view.cluster_threshold)
+                # Store the cluster map on main thread
+                QTimer.singleShot(0, lambda cm=cluster_map: setattr(self.graph_view, 'cluster_map', cm))
+            except Exception as e:
+                print(f"⚠ Error computing clusters: {e}")
+                return
+
+            # Group nodes by cluster
+            groups = {}
+            for nid, cid in cluster_map.items():
+                groups.setdefault(cid, []).append(nid)
+
+            # For each cluster, directly submit summarization tasks
+            for cid, members in groups.items():
+                node_ids = sorted(members)
+                key = tuple(node_ids)
+
+                # Skip if already cached or being computed
+                with self._summary_lock:
+                    if key in self._cluster_summary_cache or key in self._summary_futures:
+                        continue
+
+                # Build documents for this cluster
+                docs = []
+                for nid in node_ids:
+                    td = tabs.get(nid)
+                    if not td:
+                        continue
+                    widget = td.get('widget')
+                    content = getattr(widget, 'page_content', '') if widget is not None else ''
+                    docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+
+                if not docs:
+                    continue
+
+                # Submit background summarization job
+                with self._summary_lock:
+                    try:
+                        print(f"📝 Starting summarization for cluster {cid} ({len(docs)} pages)")
+                        future = self._summary_executor.submit(self.cluster_summarizer.summarize_cluster, docs)
+                        self._summary_futures[key] = future
+
+                        # Attach done callback
+                        def _done(fut, k=key):
+                            try:
+                                summary = fut.result()
+                            except Exception as ex:
+                                print(f"⚠ Cluster summarization task failed: {ex}")
+                                with self._summary_lock:
+                                    self._summary_futures.pop(k, None)
+                                return
+
+                            with self._summary_lock:
+                                self._cluster_summary_cache[k] = summary
+                                self._summary_futures.pop(k, None)
+
+                            print(f"✓ Cluster summary completed for {len(k)} pages")
+
+                            # Schedule UI update on main thread using the application instance
+                            # This ensures it runs on the main thread's event loop
+                            try:
+                                app = QApplication.instance()
+                                if app:
+                                    # Use invokeMethod to safely call from background thread
+                                    from PyQt5.QtCore import QMetaObject, Q_ARG
+                                    QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
+                            except Exception as e:
+                                print(f"⚠ Error scheduling UI update: {e}")
+
+                        future.add_done_callback(_done)
+                    except Exception as e:
+                        print(f"⚠ Failed to submit summarization task: {e}")
+
+            print(f"🔄 Started background summarization for {len(groups)} clusters")
+        except Exception as e:
+            print(f"⚠ Error in precalculate_cluster_summaries: {e}")
 
     def on_tab_changed(self, idx):
         """Handle tab changes"""

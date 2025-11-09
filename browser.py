@@ -1230,6 +1230,10 @@ class Browser(QMainWindow):
             # Go to graph view (Ctrl+G)
             self._sc_graph = QShortcut(QKeySequence('Ctrl+G'), self)
             self._sc_graph.activated.connect(self._shortcut_go_graph)
+
+            # New tab (Ctrl+T)
+            self._sc_new_tab = QShortcut(QKeySequence('Ctrl+T'), self)
+            self._sc_new_tab.activated.connect(self._shortcut_new_tab)
         except Exception:
             # If QShortcut/QKeySequence isn't available for some reason, ignore
             pass
@@ -1275,6 +1279,12 @@ class Browser(QMainWindow):
         try:
             if self.tabs.currentIndex() == self.graph_tab_index:
                 self._open_cluster_search()
+        except Exception:
+            pass
+
+    def _shortcut_new_tab(self):
+        try:
+            self.add_new_tab()
         except Exception:
             pass
 

@@ -9,6 +9,7 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView
 import math
 import random
 from anthropic import Anthropic
+from cluster_summarizer import ClusterSummarizer
 
 class GraphView(QWidget):
     """Widget that displays a graph visualization of browser tabs"""
@@ -896,11 +897,113 @@ class Browser(QMainWindow):
             self.anthropic_client = None
             print("⚠ ANTHROPIC_API_KEY not set - using random similarity")
 
+        # Prepare cluster summarizer when API available
+        if self.anthropic_client:
+            try:
+                self.cluster_summarizer = ClusterSummarizer(self.anthropic_client)
+            except Exception as e:
+                print(f"⚠ Could not initialize ClusterSummarizer: {e}")
+                self.cluster_summarizer = None
+        else:
+            self.cluster_summarizer = None
+
         # Cache for similarity scores (url1-url2 -> score)
         self.similarity_cache = {}
         # Cache file for persistent storage
         self.cache_file = os.path.expanduser('~/.vertex_browser_cache.json')
         self._load_similarity_cache()
+
+        # Cache for cluster summaries: frozenset(node ids) -> ClusterSummary
+        self._cluster_summary_cache = {}
+
+    def get_cluster_title(self, cluster_id):
+        """Return a title for the given cluster id by summarizing member pages.
+
+        This method collects pages in the cluster, calls the ClusterSummarizer
+        (if available) and returns a short title. Falls back to a simple label
+        when summarization is unavailable or fails.
+        """
+        if cluster_id is None:
+            return ""
+
+        # Find node ids in this cluster from the graph view
+        try:
+            cluster_map = getattr(self.graph_view, 'cluster_map', {})
+            node_ids = [nid for nid, cid in cluster_map.items() if cid == cluster_id]
+        except Exception:
+            node_ids = []
+
+        if not node_ids:
+            return f"Cluster {cluster_id}"
+
+        key = tuple(sorted(node_ids))
+        if key in self._cluster_summary_cache:
+            return self._cluster_summary_cache[key].title
+
+        # Build documents for summarizer
+        docs = []
+        tabs = self.get_web_tabs()
+        for nid in node_ids:
+            td = tabs.get(nid)
+            if not td:
+                continue
+            widget = td.get('widget')
+            content = getattr(widget, 'page_content', '') if widget is not None else ''
+            docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+
+        if not docs or not self.cluster_summarizer:
+            return f"Cluster {cluster_id}"
+
+        try:
+            summary = self.cluster_summarizer.summarize_cluster(docs)
+            self._cluster_summary_cache[key] = summary
+            return summary.title
+        except Exception as e:
+            print(f"⚠ Cluster summarization failed: {e}")
+            return f"Cluster {cluster_id}"
+
+    def get_cluster_description(self, cluster_id):
+        """Return a paragraph description for the given cluster id.
+
+        Delegates to the cluster summarizer and caches results.
+        """
+        if cluster_id is None:
+            return ""
+
+        try:
+            cluster_map = getattr(self.graph_view, 'cluster_map', {})
+            node_ids = [nid for nid, cid in cluster_map.items() if cid == cluster_id]
+        except Exception:
+            node_ids = []
+
+        if not node_ids:
+            return ""
+
+        key = tuple(sorted(node_ids))
+        if key in self._cluster_summary_cache:
+            return self._cluster_summary_cache[key].summary
+
+        # Build documents for summarizer
+        docs = []
+        tabs = self.get_web_tabs()
+        for nid in node_ids:
+            td = tabs.get(nid)
+            if not td:
+                continue
+            widget = td.get('widget')
+            content = getattr(widget, 'page_content', '') if widget is not None else ''
+            docs.append({'url': td.get('url', ''), 'title': td.get('title', ''), 'content': content})
+
+        if not docs or not self.cluster_summarizer:
+            return "(No description available)"
+
+        try:
+            summary = self.cluster_summarizer.summarize_cluster(docs)
+            self._cluster_summary_cache[key] = summary
+            return summary.summary
+        except Exception as e:
+            print(f"⚠ Cluster summarization failed: {e}")
+            return "(No description available)"
     
     def add_new_tab(self, url='https://www.google.com'):
         """Add a new browser tab"""

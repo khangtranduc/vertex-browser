@@ -71,6 +71,22 @@ class GraphView(QWidget):
         self.mst_result = None
         self.mst_calculator = SpanningTreeCalculator(min_edge_weight=0.2)
 
+        # Periodic refresh timer to check for new similarities
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.timeout.connect(self._check_for_updates)
+        self._refresh_timer.start(2000)  # Check every 2 seconds
+        self._last_similarity_count = 0
+
+    def _check_for_updates(self):
+        """Periodically check if new similarities have been calculated and update if needed"""
+        if not self.isVisible():
+            return  # Don't update if not visible
+
+        current_count = len(self.browser.similarity_cache)
+        if current_count != self._last_similarity_count:
+            self._last_similarity_count = current_count
+            self.update()  # Trigger repaint
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -122,7 +138,14 @@ class GraphView(QWidget):
         painter.translate(self.offset_x, self.offset_y)
         painter.scale(self.zoom, self.zoom)
         
-        # Draw edges (connections between tabs)
+        # Check if we have enough similarities calculated to show the graph
+        if not self._has_sufficient_similarities(tabs, tab_indices):
+            painter.setPen(QPen(QColor(120, 125, 130)))
+            painter.setFont(QFont('SF Pro Display', 14))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                           "Calculating similarities...\nPlease wait while we analyze your tabs")
+            return
+
         # Draw edges (connections between tabs)
         self.draw_edges(painter, tabs, tab_indices)
         
@@ -501,12 +524,34 @@ class GraphView(QWidget):
         # Transform screen coordinates to graph coordinates
         graph_x = (screen_x - self.offset_x) / self.zoom
         graph_y = (screen_y - self.offset_y) / self.zoom
-        
+
         for idx, (x, y) in self.node_positions.items():
             distance = math.sqrt((graph_x - x)**2 + (graph_y - y)**2)
             if distance <= 116:  # Max node radius (updated to match larger nodes)
                 return idx
         return None
+
+    def _has_sufficient_similarities(self, tabs, tab_indices):
+        """Check if we have calculated similarities for most tab pairs"""
+        if len(tab_indices) < 2:
+            return True  # No similarities needed
+
+        total_pairs = 0
+        calculated_pairs = 0
+
+        for i, idx1 in enumerate(tab_indices):
+            for idx2 in tab_indices[i+1:]:
+                total_pairs += 1
+                sim = self.browser.calculate_similarity(
+                    tabs[idx1]['url'], tabs[idx2]['url']
+                )
+                if sim is not None:
+                    calculated_pairs += 1
+
+        # Require at least 80% of similarities to be calculated
+        if total_pairs == 0:
+            return True
+        return (calculated_pairs / total_pairs) >= 0.8
 
     def draw_edges(self, painter, tabs, tab_indices, threshold=0.20):
         """Draw edges between nodes when similarity exceeds threshold.
@@ -528,8 +573,10 @@ class GraphView(QWidget):
                         similarity = self.browser.calculate_similarity(
                             tabs[idx1]['url'], tabs[idx2]['url']
                         )
+                        if similarity is None:
+                            continue  # Skip uncalculated similarities
                     except Exception as e:
-                        similarity = 0.0
+                        continue
 
                     if similarity > threshold:
                         edges.append(Edge(idx1, idx2, similarity))
@@ -557,8 +604,10 @@ class GraphView(QWidget):
                         similarity = self.browser.calculate_similarity(
                             tabs[idx1]['url'], tabs[idx2]['url']
                         )
+                        if similarity is None:
+                            continue  # Skip uncalculated similarities
                     except Exception as e:
-                        similarity = 0.0
+                        continue
 
                     if similarity > threshold:
                         self._draw_edge(painter, idx1, idx2, similarity)
@@ -654,9 +703,13 @@ class GraphView(QWidget):
         for i, id1 in enumerate(tab_indices):
             for id2 in tab_indices[i+1:]:
                 try:
-                    sim = float(self.browser.calculate_similarity(
+                    sim = self.browser.calculate_similarity(
                         tabs[id1]['url'], tabs[id2]['url']
-                    ))
+                    )
+                    if sim is None:
+                        sim = 0.0
+                    else:
+                        sim = float(sim)
                 except Exception:
                     sim = 0.0
 
@@ -775,9 +828,13 @@ class GraphView(QWidget):
 
                 # attractive force based on similarity (only if above threshold)
                 try:
-                    sim = float(self.browser.calculate_similarity(
+                    sim = self.browser.calculate_similarity(
                         tabs[id1]['url'], tabs[id2]['url']
-                    ))
+                    )
+                    if sim is None:
+                        sim = 0.0  # Treat uncalculated as no attraction
+                    else:
+                        sim = float(sim)
                 except Exception:
                     sim = 0.0
 
@@ -1139,11 +1196,25 @@ class BrowserTab(QWidget):
             self.content_extraction_pending = False
             # Trigger graph update after content is extracted
             if hasattr(self, 'browser_parent') and self.browser_parent:
-                self.browser_parent.update_graph()
-                # Pre-calculate similarities in background (with delay to avoid blocking)
-                QTimer.singleShot(500, lambda: self.browser_parent.precalculate_similarities())
-                # Pre-generate cluster summaries in background (with delay)
-                QTimer.singleShot(1000, lambda: self.browser_parent.precalculate_cluster_summaries())
+                browser = self.browser_parent
+                browser.update_graph()
+
+                # Check if in batch loading mode
+                if getattr(browser, '_skip_auto_processing', False):
+                    # Increment loaded count
+                    browser._batch_loaded_count = getattr(browser, '_batch_loaded_count', 0) + 1
+                    print(f"  [{browser._batch_loaded_count}/{browser._batch_total_count}] Content extracted")
+
+                    # If all loaded, process once
+                    if browser._batch_loaded_count >= browser._batch_total_count:
+                        print(f"✓ All content extracted - calculating similarities and clusters...")
+                        browser._skip_auto_processing = False
+                        browser.precalculate_similarities()
+                        QTimer.singleShot(2000, lambda: browser.precalculate_cluster_summaries())
+                else:
+                    # Normal auto-processing
+                    QTimer.singleShot(500, lambda: browser.precalculate_similarities())
+                    QTimer.singleShot(1000, lambda: browser.precalculate_cluster_summaries())
 
         self.web_view.page().runJavaScript(js_code, handle_content)
 
@@ -1545,16 +1616,8 @@ class Browser(QMainWindow):
                     self._cluster_summary_cache[k] = summary
                     self._summary_futures.pop(k, None)
 
-                # Schedule UI update on main thread using thread-safe method
-                try:
-                    app = QApplication.instance()
-                    if app:
-                        # Use invokeMethod to safely call from background thread
-                        QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
-                        # Also refresh search panel if open
-                        QMetaObject.invokeMethod(self, "_refresh_search_panel", Qt.QueuedConnection)
-                except Exception as e:
-                    print(f"⚠ Error scheduling UI update: {e}")
+                # UI will update via periodic refresh timer - no need for manual trigger
+                print(f"✓ Cluster summary completed for {len(k)} pages")
 
             future.add_done_callback(_done)
 
@@ -1676,11 +1739,8 @@ class Browser(QMainWindow):
                     self._cluster_summary_cache[k] = summary
                     self._summary_futures.pop(k, None)
 
-                # Schedule UI update on main thread
-                try:
-                    QTimer.singleShot(0, lambda: self.graph_view.update())
-                except Exception:
-                    pass
+                # UI will update via periodic refresh timer
+                print(f"✓ Cluster summary completed")
 
             future.add_done_callback(_done)
 
@@ -1747,10 +1807,8 @@ class Browser(QMainWindow):
                     self._cluster_summary_cache[k] = summary
                     self._summary_futures.pop(k, None)
 
-                try:
-                    QTimer.singleShot(0, lambda: self.graph_view.update())
-                except Exception:
-                    pass
+                # UI will update via periodic refresh timer
+                print(f"✓ Cluster summary completed")
 
             future.add_done_callback(_done)
 
@@ -1843,8 +1901,28 @@ class Browser(QMainWindow):
     
     def calculate_similarity(self, url1, url2):
         """
-        Calculate similarity between two tabs using Claude AI to analyze
-        page content. Returns a float between 0.0 and 1.0.
+        Get cached similarity between two tabs. Returns None if not yet calculated.
+        Does NOT make API calls - use _calculate_similarity_sync for that.
+
+        Args:
+            url1, url2: URLs to compare
+
+        Returns:
+            Float between 0.0 and 1.0 if calculated, None otherwise
+        """
+        # Create a cache key (ensure consistent ordering)
+        cache_key = f"{min(url1, url2)}||{max(url1, url2)}"
+
+        # Return cached value if available, None otherwise
+        return self.similarity_cache.get(cache_key)
+
+    def _calculate_similarity_sync(self, url1, url2):
+        """
+        Internal method to actually calculate similarity (blocking API call).
+        Only call from background threads!
+
+        Returns:
+            Float between 0.0 and 1.0
         """
         # Create a cache key (ensure consistent ordering)
         cache_key = f"{min(url1, url2)}||{max(url1, url2)}"
@@ -1853,12 +1931,9 @@ class Browser(QMainWindow):
         if cache_key in self.similarity_cache:
             return self.similarity_cache[cache_key]
 
-        # If no API client, fall back to random similarity
+        # If no API client, return low similarity
         if not self.anthropic_client:
-            score = random.random()
-            self.similarity_cache[cache_key] = score
-            return score
-
+            return 0.0
         # Get tab content for both URLs
         tabs = self.get_web_tabs()
         content1 = None
@@ -1870,11 +1945,9 @@ class Browser(QMainWindow):
             if tab_data['url'] == url2:
                 content2 = tab_data['content']
 
-        # If either page has no content yet, cache and return low similarity
+        # If either page has no content yet, return None (not ready)
         if not content1 or not content2:
-            # Cache the low result to prevent repeated checks
-            self.similarity_cache[cache_key] = 0.0
-            return 0.0
+            return None
 
         try:
             # Use Claude to analyze similarity
@@ -1955,8 +2028,10 @@ class Browser(QMainWindow):
             try:
                 url1 = tabs[idx1]['url']
                 url2 = tabs[idx2]['url']
-                # This will cache the result
-                self.calculate_similarity(url1, url2)
+                # This will cache the result (blocking API call in background thread)
+                self._calculate_similarity_sync(url1, url2)
+                # Don't trigger UI update here - too frequent, causes grey page
+                # The graph will update on its own when user switches to it
             except Exception as e:
                 print(f"⚠ Background similarity calculation error: {e}")
 
@@ -2046,20 +2121,8 @@ class Browser(QMainWindow):
                                 self._cluster_summary_cache[k] = summary
                                 self._summary_futures.pop(k, None)
 
+                            # UI will update via periodic refresh timer
                             print(f"✓ Cluster summary completed for {len(k)} pages")
-
-                            # Schedule UI update on main thread using the application instance
-                            # This ensures it runs on the main thread's event loop
-                            try:
-                                app = QApplication.instance()
-                                if app:
-                                    # Use invokeMethod to safely call from background thread
-                                    from PyQt5.QtCore import QMetaObject, Q_ARG
-                                    QMetaObject.invokeMethod(self.graph_view, "update", Qt.QueuedConnection)
-                                    # Also refresh search panel if open
-                                    QMetaObject.invokeMethod(self, "_refresh_search_panel", Qt.QueuedConnection)
-                            except Exception as e:
-                                print(f"⚠ Error scheduling UI update: {e}")
 
                         future.add_done_callback(_done)
                     except Exception as e:
@@ -2074,11 +2137,77 @@ class Browser(QMainWindow):
         if idx == self.graph_tab_index:
             self.update_graph()
 
+    def load_urls_from_file(self, file_path):
+        """Load URLs from a text file and open them in tabs.
+
+        File format: One URL per line, blank lines and lines starting with # are ignored.
+        """
+        try:
+            with open(file_path, 'r') as f:
+                urls = []
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    urls.append(line)
+
+            if not urls:
+                print(f"⚠ No URLs found in {file_path}")
+                return
+
+            print(f"📂 Loading {len(urls)} URLs from {file_path}")
+
+            # Disable auto-processing during batch load
+            self._skip_auto_processing = True
+            self._batch_loaded_count = 0
+            self._batch_total_count = len(urls)
+
+            # Load each URL in a new tab
+            for url in urls:
+                try:
+                    self.add_new_tab(url)
+                    print(f"  ✓ Opened: {url}")
+                except Exception as e:
+                    print(f"  ⚠ Failed to open {url}: {e}")
+
+            print(f"✓ Loaded {len(urls)} tabs - waiting for content extraction...")
+
+        except FileNotFoundError:
+            print(f"⚠ File not found: {file_path}")
+        except Exception as e:
+            print(f"⚠ Error loading URLs from file: {e}")
+
 
 def main():
-    app = QApplication(sys.argv)
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Vertex Browser - AI-powered browser with graph visualization')
+    parser.add_argument('--urls', type=str, help='Path to text file containing URLs to load on startup')
+    parser.add_argument('--demo', action='store_true', help='Load demo URLs from demo_urls.txt')
+
+    # Parse known args to allow Qt args to pass through
+    args, unknown = parser.parse_known_args()
+
+    # Reconstruct argv for QApplication (it needs Qt-specific args)
+    qt_argv = [sys.argv[0]] + unknown
+
+    app = QApplication(qt_argv)
     browser = Browser()
+
+    # Load URLs from file if specified (before showing browser)
+    if args.demo:
+        demo_file = os.path.join(os.path.dirname(__file__), 'demo_urls.txt')
+        if os.path.exists(demo_file):
+            browser.load_urls_from_file(demo_file)
+        else:
+            print(f"⚠ Demo file not found: {demo_file}")
+    elif args.urls:
+        browser.load_urls_from_file(args.urls)
+
+    # Show browser (URLs are already loading in background if specified)
     browser.show()
+
     sys.exit(app.exec_())
 
 

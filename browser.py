@@ -1,7 +1,7 @@
 import sys
 import os
 import json
-from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect, QEvent
+from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect, QEvent, QMetaObject, Q_ARG
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon, QFontMetrics, QKeySequence
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel, QShortcut, QListWidget, QListWidgetItem)
@@ -1315,6 +1315,20 @@ class Browser(QMainWindow):
 
                 panel.setLayout(layout)
 
+                # Add event handler for fuzzy search updates
+                def panel_event_filter(obj, event):
+                    if event.type() == QEvent.User and hasattr(panel, '_pending_fuzzy_results'):
+                        # Process fuzzy results on main thread
+                        fuzzy_results = panel._pending_fuzzy_results
+                        delattr(panel, '_pending_fuzzy_results')
+                        if hasattr(panel, '_update_fuzzy'):
+                            panel._update_fuzzy(fuzzy_results)
+                        return True
+                    return False
+
+                panel.eventFilter = panel_event_filter
+                panel.installEventFilter(panel)
+
                 # Close on Esc
                 esc_short = QShortcut(QKeySequence('Esc'), panel)
                 esc_short.activated.connect(panel.hide)
@@ -1352,22 +1366,66 @@ class Browser(QMainWindow):
                         doc_count = len(members)
                         clusters.append(SimpleNamespace(title=title, summary=summary, tags=tags, urls=urls, doc_count=doc_count, cluster_id=cid))
 
-                    # Use fuzzy search if Anthropic API is available
-                    if self.anthropic_client:
-                        searcher = ClusterSearcher(anthropic_client=self.anthropic_client, enable_fuzzy=True)
-                    else:
-                        searcher = ClusterSearcher()
+                    # STEP 1: Show keyword-based results immediately
+                    keyword_searcher = ClusterSearcher()  # No fuzzy search
                     try:
-                        results = searcher.search(clusters, q, min_score=0.0, max_results=50)
+                        keyword_results = keyword_searcher.search(clusters, q, min_score=0.0, max_results=50)
                     except Exception:
-                        results = []
+                        keyword_results = []
 
-                    for res in results:
+                    # Display keyword results immediately
+                    for res in keyword_results:
                         item = QListWidgetItem(f"{res.cluster.title} — score {res.score:.2f}")
-                        # attach the cluster id so we can select it on click
                         item.setData(Qt.UserRole, getattr(res.cluster, 'cluster_id', None))
                         item.setToolTip((res.cluster.summary or '')[:400])
                         results_list.addItem(item)
+
+                    # STEP 2: If API available, update with fuzzy results in background
+                    if self.anthropic_client:
+                        # Create helper method that can be invoked from background thread
+                        def update_with_fuzzy_results(fuzzy_results):
+                            try:
+                                print(f"📊 Updating UI with fuzzy results for: '{q}'")
+                                results_list.clear()
+                                for res in fuzzy_results:
+                                    item = QListWidgetItem(f"{res.cluster.title} — score {res.score:.2f} 🔍")
+                                    item.setData(Qt.UserRole, getattr(res.cluster, 'cluster_id', None))
+                                    item.setToolTip((res.cluster.summary or '')[:400])
+                                    results_list.addItem(item)
+                                print(f"✓ UI updated with {results_list.count()} fuzzy results")
+                            except Exception as e:
+                                import traceback
+                                print(f"⚠ UI update error: {e}")
+                                print(traceback.format_exc())
+
+                        # Store reference to update function
+                        panel._update_fuzzy = update_with_fuzzy_results
+
+                        def run_fuzzy_search():
+                            try:
+                                print(f"🔍 Starting fuzzy search for: '{q}' (in background thread)")
+                                fuzzy_searcher = ClusterSearcher(anthropic_client=self.anthropic_client, enable_fuzzy=True)
+                                fuzzy_results = fuzzy_searcher.search(clusters, q, min_score=0.0, max_results=50)
+                                print(f"✓ Fuzzy search completed for: '{q}' ({len(fuzzy_results)} results)")
+
+                                # Update UI using the app's event loop from background thread
+                                print(f"⏰ Invoking UI update on main thread")
+                                QApplication.instance().postEvent(
+                                    panel,
+                                    QEvent(QEvent.User)
+                                )
+                                # Store results for the event handler
+                                panel._pending_fuzzy_results = fuzzy_results
+                                print(f"⏰ UI update event posted")
+                            except Exception as e:
+                                import traceback
+                                print(f"⚠ Fuzzy search error: {e}")
+                                print(traceback.format_exc())
+
+                        # Run fuzzy search in background
+                        print(f"📤 Submitting fuzzy search task to executor")
+                        future = self._summary_executor.submit(run_fuzzy_search)
+                        print(f"📤 Fuzzy search task submitted: {future}")
 
                 search_edit.returnPressed.connect(do_search)
 

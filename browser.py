@@ -45,6 +45,10 @@ class GraphView(QWidget):
         self._physics_timer = QTimer(self)
         self._physics_timer.timeout.connect(self._physics_tick)
         self._physics_timer.start(self.physics_interval_ms)
+        # Clustering
+        self.cluster_threshold = 0.30
+        self.cluster_map = {}
+        self.cluster_colors = {}
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -102,6 +106,12 @@ class GraphView(QWidget):
         self.draw_edges(painter, tabs, tab_indices)
         
         # Draw nodes
+        # Compute clustering based on current similarities
+        try:
+            self.cluster_map = self.compute_clusters(tabs, tab_indices, threshold=self.cluster_threshold)
+        except Exception:
+            self.cluster_map = {}
+
         for idx, (x, y) in self.node_positions.items():
             tab_data = tabs[idx]
 
@@ -118,13 +128,23 @@ class GraphView(QWidget):
                 border_width = 2.5
             else:
                 radius = 32
-                # Clean white with subtle blue tint (normal)
+                # Color by cluster if available
+                cluster_id = self.cluster_map.get(idx, None)
+                if cluster_id is not None:
+                    if cluster_id not in self.cluster_colors:
+                        hue = (cluster_id * 47) % 360
+                        self.cluster_colors[cluster_id] = QColor.fromHsv(hue, 180, 245)
+                    base_color = self.cluster_colors[cluster_id]
+                else:
+                    base_color = QColor(245, 247, 250)
+
+                # Subtle radial gradient tinted by cluster color
                 gradient = QRadialGradient(x, y, radius)
-                gradient.setColorAt(0, QColor(255, 255, 255))
-                gradient.setColorAt(0.8, QColor(245, 247, 250))
-                gradient.setColorAt(1, QColor(230, 235, 240))
+                gradient.setColorAt(0, base_color.lighter(120))
+                gradient.setColorAt(0.8, base_color.lighter(105))
+                gradient.setColorAt(1, base_color.darker(110))
                 node_brush = QBrush(gradient)
-                border_color = QColor(200, 210, 220)
+                border_color = base_color.darker(120)
                 border_width = 2
 
             # Soft shadow (not glow)
@@ -307,6 +327,57 @@ class GraphView(QWidget):
                         painter.setFont(QFont('SF Pro Display', 9, QFont.Bold))
                         painter.setPen(QPen(QColor(66, 133, 244)))
                         painter.drawText(int(mid_x), int(mid_y - 5), f"{similarity:.2f}")
+
+    def compute_clusters(self, tabs, tab_indices, threshold=None):
+        """Compute clusters as connected components where edge weight >= threshold.
+
+        Returns a dict mapping node id -> small integer cluster id.
+        This is a simple, fast approach that groups strongly-connected nodes.
+        """
+        if threshold is None:
+            threshold = self.cluster_threshold
+
+        # Initialize union-find parents
+        parents = {nid: nid for nid in tab_indices}
+
+        def find(a):
+            # path compression
+            while parents[a] != a:
+                parents[a] = parents[parents[a]]
+                a = parents[a]
+            return a
+
+        def union(a, b):
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parents[rb] = ra
+
+        # Union pairs with similarity >= threshold
+        for i, id1 in enumerate(tab_indices):
+            for id2 in tab_indices[i+1:]:
+                try:
+                    sim = float(self.browser.calculate_similarity(
+                        tabs[id1]['url'], tabs[id2]['url']
+                    ))
+                except Exception:
+                    sim = 0.0
+
+                if sim >= threshold:
+                    union(id1, id2)
+
+        # Assign compact cluster ids
+        cluster_roots = {}
+        cluster_map = {}
+        next_id = 0
+        for nid in tab_indices:
+            root = find(nid)
+            if root not in cluster_roots:
+                cluster_roots[root] = next_id
+                next_id += 1
+            cluster_map[nid] = cluster_roots[root]
+
+        return cluster_map
 
     def _physics_tick(self):
         """Timer tick: apply a small physics step and request repaint."""
@@ -854,28 +925,28 @@ class Browser(QMainWindow):
             # Use Claude to analyze similarity
             prompt = f"""You are analyzing the semantic similarity between two web pages. Provide a precise similarity score.
 
-Page 1 URL: {url1}
-Page 1 Content:
-{content1[:3000]}
+            Page 1 URL: {url1}
+            Page 1 Content:
+            {content1[:3000]}
 
-Page 2 URL: {url2}
-Page 2 Content:
-{content2[:3000]}
+            Page 2 URL: {url2}
+            Page 2 Content:
+            {content2[:3000]}
 
-Analyze how similar these pages are based on:
-- Topic and subject matter (most important)
-- Content type (article, documentation, shopping, social media, etc.)
-- Domain/category (news, tech, sports, finance, etc.)
+            Analyze how similar these pages are based on:
+            - Topic and subject matter (most important)
+            - Content type (article, documentation, shopping, social media, etc.)
+            - Domain/category (news, tech, sports, finance, etc.)
 
-Respond with ONLY a decimal number between 0.00 and 1.00 (use 2 decimal places for precision):
-- 0.00-0.10 = completely unrelated topics
-- 0.20-0.35 = tangentially related (same broad category)
-- 0.40-0.60 = moderately related (overlapping themes)
-- 0.65-0.80 = closely related (similar topics)
-- 0.85-0.95 = very similar (same specific topic)
-- 0.98-1.00 = nearly identical content
+            Respond with ONLY a decimal number between 0.00 and 1.00 (use 2 decimal places for precision):
+            - 0.00-0.10 = completely unrelated topics
+            - 0.20-0.35 = tangentially related (same broad category)
+            - 0.40-0.60 = moderately related (overlapping themes)
+            - 0.65-0.80 = closely related (similar topics)
+            - 0.85-0.95 = very similar (same specific topic)
+            - 0.98-1.00 = nearly identical content
 
-Be precise and use the full range. Respond with ONLY the number (e.g., 0.73)."""
+            Be precise and use the full range. Respond with ONLY the number (e.g., 0.73)."""
 
             message = self.anthropic_client.messages.create(
                 model="claude-3-5-haiku-20241022",  # Fast and cost-effective

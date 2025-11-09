@@ -9,6 +9,8 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView
 import math
 import random
 from anthropic import Anthropic
+import concurrent.futures
+import threading
 from cluster_summarizer import ClusterSummarizer
 
 class GraphView(QWidget):
@@ -915,6 +917,10 @@ class Browser(QMainWindow):
 
         # Cache for cluster summaries: frozenset(node ids) -> ClusterSummary
         self._cluster_summary_cache = {}
+        # Thread pool for background summarization
+        self._summary_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._summary_futures = {}  # key -> Future
+        self._summary_lock = threading.Lock()
 
     def get_cluster_title(self, cluster_id):
         """Return a title for the given cluster id by summarizing member pages.
@@ -953,14 +959,43 @@ class Browser(QMainWindow):
 
         if not docs or not self.cluster_summarizer:
             return f"Cluster {cluster_id}"
+        # If a summary is already being computed, return placeholder
+        with self._summary_lock:
+            if key in self._summary_futures:
+                return "Loading..."
 
-        try:
-            summary = self.cluster_summarizer.summarize_cluster(docs)
-            self._cluster_summary_cache[key] = summary
-            return summary.title
-        except Exception as e:
-            print(f"⚠ Cluster summarization failed: {e}")
-            return f"Cluster {cluster_id}"
+            # Submit background job
+            try:
+                future = self._summary_executor.submit(self.cluster_summarizer.summarize_cluster, docs)
+            except Exception as e:
+                print(f"⚠ Failed to submit summarization task: {e}")
+                return f"Cluster {cluster_id}"
+
+            self._summary_futures[key] = future
+
+            # Attach done callback
+            def _done(fut, k=key):
+                try:
+                    summary = fut.result()
+                except Exception as ex:
+                    print(f"⚠ Cluster summarization task failed: {ex}")
+                    with self._summary_lock:
+                        self._summary_futures.pop(k, None)
+                    return
+
+                with self._summary_lock:
+                    self._cluster_summary_cache[k] = summary
+                    self._summary_futures.pop(k, None)
+
+                # Schedule UI update on main thread
+                try:
+                    QTimer.singleShot(0, lambda: self.graph_view.update())
+                except Exception:
+                    pass
+
+            future.add_done_callback(_done)
+
+        return "Loading..."
 
     def get_cluster_description(self, cluster_id):
         """Return a paragraph description for the given cluster id.
@@ -996,14 +1031,41 @@ class Browser(QMainWindow):
 
         if not docs or not self.cluster_summarizer:
             return "(No description available)"
+        # If a summary is already being computed, return placeholder
+        with self._summary_lock:
+            if key in self._summary_futures:
+                return "Loading..."
 
-        try:
-            summary = self.cluster_summarizer.summarize_cluster(docs)
-            self._cluster_summary_cache[key] = summary
-            return summary.summary
-        except Exception as e:
-            print(f"⚠ Cluster summarization failed: {e}")
-            return "(No description available)"
+            # Submit background job
+            try:
+                future = self._summary_executor.submit(self.cluster_summarizer.summarize_cluster, docs)
+            except Exception as e:
+                print(f"⚠ Failed to submit summarization task: {e}")
+                return "(No description available)"
+
+            self._summary_futures[key] = future
+
+            def _done(fut, k=key):
+                try:
+                    summary = fut.result()
+                except Exception as ex:
+                    print(f"⚠ Cluster summarization task failed: {ex}")
+                    with self._summary_lock:
+                        self._summary_futures.pop(k, None)
+                    return
+
+                with self._summary_lock:
+                    self._cluster_summary_cache[k] = summary
+                    self._summary_futures.pop(k, None)
+
+                try:
+                    QTimer.singleShot(0, lambda: self.graph_view.update())
+                except Exception:
+                    pass
+
+            future.add_done_callback(_done)
+
+        return "Loading..."
     
     def add_new_tab(self, url='https://www.google.com'):
         """Add a new browser tab"""

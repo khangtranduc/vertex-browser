@@ -93,15 +93,32 @@ class ClusterSummarizer:
             # Truncate content if too long
             content = doc['content'][:self.max_content_chars]
 
-            prompt = f"""Summarize this web page in one concise sentence. Focus on the main topic or purpose.
+            # Skip if content is empty or too short
+            if not content or len(content.strip()) < 20:
+                print(f"    ⚠ Skipping - insufficient content")
+                summaries.append(f"Page about {doc['title']}")
+                continue
+
+            prompt = f"""Summarize this web page in one clear, complete sentence that describes what the page is about.
 
 URL: {doc['url']}
 Title: {doc['title']}
 Content: {content}
 
-Respond with ONLY one sentence summarizing the main topic."""
+Write a natural sentence describing the page's main topic or purpose. Do not write placeholder text or error messages.
+
+Example format: "This page covers [topic] and explains [key points]."
+
+Your summary:"""
 
             summary = self._call_claude_with_retry(prompt, max_tokens=100)
+
+            # Validate summary - check for placeholder/error patterns
+            summary_lower = summary.lower()
+            if any(phrase in summary_lower for phrase in ['placeholder', 'error', 'cannot', 'unable to', 'i apologize', 'i cannot']):
+                print(f"    ⚠ Got placeholder/error response, using fallback")
+                summary = f"Web page about {doc['title']}"
+
             summaries.append(summary)
 
         return summaries
@@ -137,12 +154,17 @@ Respond with ONLY one sentence summarizing the main topic."""
         """Combine a batch of summaries into one"""
         summaries_text = "\n".join(f"- {s}" for s in summaries)
 
-        prompt = f"""These are summaries of related web pages. Combine them into a brief paragraph (2-3 sentences) that captures the common theme or topic.
+        prompt = f"""These are summaries of related web pages. Combine them into a brief paragraph (2-3 sentences) that describes what this collection of pages covers.
 
 Summaries:
 {summaries_text}
 
-Respond with a 2-3 sentence paragraph describing the overall theme."""
+Write a cohesive summary that:
+- Describes the main topic and themes across all pages
+- Sounds natural to a user browsing their tabs
+- Avoids meta-references like "these summaries" or "the documents"
+
+Respond with a 2-3 sentence paragraph describing the overall content."""
 
         return self._call_claude_with_retry(prompt, max_tokens=150)
 

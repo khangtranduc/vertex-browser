@@ -2,9 +2,9 @@ import sys
 import os
 import json
 from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect, QEvent
-from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon, QFontMetrics
+from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon, QFontMetrics, QKeySequence
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
-                             QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel, QCheckBox)
+                             QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel, QCheckBox, QShortcut, QListWidget, QListWidgetItem)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 import math
 import random
@@ -13,6 +13,8 @@ import concurrent.futures
 import threading
 from cluster_summarizer import ClusterSummarizer
 from spanning_tree import SpanningTreeCalculator, Edge
+from cluster_search import ClusterSearcher
+from types import SimpleNamespace
 
 class GraphView(QWidget):
     """Widget that displays a graph visualization of browser tabs"""
@@ -1208,6 +1210,186 @@ class Browser(QMainWindow):
         self._summary_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self._summary_futures = {}  # key -> Future
         self._summary_lock = threading.Lock()
+
+        # Keyboard shortcuts
+        try:
+            # Next/Previous tab navigation (Ctrl+Tab / Ctrl+Shift+Tab)
+            self._sc_next = QShortcut(QKeySequence('Ctrl+Tab'), self)
+            self._sc_next.activated.connect(self._shortcut_next_tab)
+
+            self._sc_prev = QShortcut(QKeySequence('Ctrl+Shift+Tab'), self)
+            self._sc_prev.activated.connect(self._shortcut_prev_tab)
+
+            # Cluster search (Ctrl+F)
+            self._sc_find = QShortcut(QKeySequence('Ctrl+F'), self)
+            self._sc_find.activated.connect(self._shortcut_find)
+
+            # Go to graph view (Ctrl+G)
+            self._sc_graph = QShortcut(QKeySequence('Ctrl+G'), self)
+            self._sc_graph.activated.connect(self._shortcut_go_graph)
+        except Exception:
+            # If QShortcut/QKeySequence isn't available for some reason, ignore
+            pass
+
+        # Cluster search panel (created on-demand)
+        self._cluster_search_panel = None
+
+    # --- Keyboard shortcut handlers ---------------------------------
+    def _shortcut_next_tab(self):
+        try:
+            count = self.tabs.count()
+            if count <= 1:
+                return
+            new_index = (self.tabs.currentIndex() + 1) % count
+            self.tabs.setCurrentIndex(new_index)
+        except Exception:
+            pass
+
+    def _shortcut_prev_tab(self):
+        try:
+            count = self.tabs.count()
+            if count <= 1:
+                return
+            new_index = (self.tabs.currentIndex() - 1) % count
+            self.tabs.setCurrentIndex(new_index)
+        except Exception:
+            pass
+
+    def _shortcut_go_graph(self):
+        try:
+            if hasattr(self, 'graph_tab_index') and 0 <= self.graph_tab_index < self.tabs.count():
+                self.tabs.setCurrentIndex(self.graph_tab_index)
+                # Give focus to the graph view widget
+                try:
+                    self.graph_view.setFocus()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _shortcut_find(self):
+        # Only open search when currently viewing the graph
+        try:
+            if self.tabs.currentIndex() == self.graph_tab_index:
+                self._open_cluster_search()
+        except Exception:
+            pass
+
+    def _open_cluster_search(self):
+        """Create (if needed) and show the cluster search panel anchored to the Graph View."""
+        # Create panel lazily
+        try:
+            if self._cluster_search_panel is None:
+                panel = QWidget(self.graph_view)
+                panel.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
+                panel.setAttribute(Qt.WA_ShowWithoutActivating)
+                layout = QVBoxLayout()
+                layout.setContentsMargins(8, 8, 8, 8)
+
+                # Search input
+                search_edit = QLineEdit()
+                if self.anthropic_client:
+                    search_edit.setPlaceholderText('🔍 AI-powered search... (press Enter)')
+                else:
+                    search_edit.setPlaceholderText('Search clusters... (press Enter)')
+                layout.addWidget(search_edit)
+
+                # Results list
+                results_list = QListWidget()
+                layout.addWidget(results_list)
+
+                panel.setLayout(layout)
+
+                # Close on Esc
+                esc_short = QShortcut(QKeySequence('Esc'), panel)
+                esc_short.activated.connect(panel.hide)
+
+                # Store widgets for reuse
+                panel._search_edit = search_edit
+                panel._results_list = results_list
+
+                # Perform search when user presses Enter
+                def do_search():
+                    q = search_edit.text().strip()
+                    results_list.clear()
+                    if not q:
+                        return
+
+                    # Build clusters from current graph
+                    tabs = self.get_web_tabs()
+                    tab_indices = list(tabs.keys())
+                    cluster_map = {}
+                    try:
+                        cluster_map = self.graph_view.compute_clusters(tabs, tab_indices, threshold=self.graph_view.cluster_threshold)
+                    except Exception:
+                        cluster_map = {}
+
+                    groups = {}
+                    for nid, cid in cluster_map.items():
+                        groups.setdefault(cid, []).append(nid)
+
+                    clusters = []
+                    for cid, members in groups.items():
+                        title = self.get_cluster_title(cid)
+                        summary = self.get_cluster_description(cid)
+                        tags = self.get_cluster_tags(cid) or []
+                        urls = [tabs.get(nid, {}).get('url', '') for nid in members]
+                        doc_count = len(members)
+                        clusters.append(SimpleNamespace(title=title, summary=summary, tags=tags, urls=urls, doc_count=doc_count, cluster_id=cid))
+
+                    # Use fuzzy search if Anthropic client is available
+                    if self.anthropic_client:
+                        searcher = ClusterSearcher(
+                            anthropic_client=self.anthropic_client,
+                            enable_fuzzy=True
+                        )
+                    else:
+                        searcher = ClusterSearcher()
+
+                    try:
+                        results = searcher.search(clusters, q, min_score=0.0, max_results=50)
+                    except Exception as e:
+                        print(f"⚠ Search error: {e}")
+                        results = []
+
+                    for res in results:
+                        item = QListWidgetItem(f"{res.cluster.title} — score {res.score:.2f}")
+                        # attach the cluster id so we can select it on click
+                        item.setData(Qt.UserRole, getattr(res.cluster, 'cluster_id', None))
+                        item.setToolTip((res.cluster.summary or '')[:400])
+                        results_list.addItem(item)
+
+                search_edit.returnPressed.connect(do_search)
+
+                # Click result -> switch to graph tab and select cluster
+                def on_result_clicked(item):
+                    cid = item.data(Qt.UserRole)
+                    if cid is None:
+                        return
+                    # Switch to graph tab and select cluster
+                    try:
+                        self.tabs.setCurrentIndex(self.graph_tab_index)
+                        self.graph_view.selected_cluster = cid
+                        self.graph_view.update()
+                    except Exception:
+                        pass
+                    panel.hide()
+
+                results_list.itemClicked.connect(on_result_clicked)
+
+                self._cluster_search_panel = panel
+
+            # Position and show panel
+            panel = self._cluster_search_panel
+            # Place near top-left of graph view with a small margin
+            panel.resize(420, 360)
+            panel.move(20, 20)
+            panel.show()
+            panel.raise_()
+            panel._search_edit.setFocus()
+
+        except Exception as e:
+            print(f"⚠ Failed to open cluster search panel: {e}")
 
     def get_cluster_title(self, cluster_id):
         """Return a title for the given cluster id by summarizing member pages.

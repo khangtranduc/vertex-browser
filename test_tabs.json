@@ -1,0 +1,67 @@
+{
+  "description": "Test tab configurations for Vertex Browser",
+  "presets": {
+    "default": {
+      "name": "Mixed Topics Demo",
+      "tabs": [
+        "https://docs.python.org/3/tutorial/",
+        "https://realpython.com/python-basics/",
+        "https://www.learnpython.org/",
+        "https://pytorch.org/tutorials/",
+        "https://www.tensorflow.org/tutorials",
+        "https://scikit-learn.org/stable/tutorial/index.html",
+        "https://developer.mozilla.org/en-US/docs/Learn",
+        "https://reactjs.org/docs/getting-started.html",
+        "https://nodejs.org/en/docs/",
+        "https://pandas.pydata.org/docs/getting_started/tutorials.html",
+        "https://matplotlib.org/stable/tutorials/index.html",
+        "https://news.ycombinator.com/",
+        "https://techcrunch.com/"
+      ]
+    },
+    "python": {
+      "name": "Python Programming",
+      "tabs": [
+        "https://docs.python.org/3/tutorial/",
+        "https://realpython.com/python-basics/",
+        "https://www.learnpython.org/",
+        "https://docs.python.org/3/library/",
+        "https://pypi.org/",
+        "https://python-poetry.org/docs/"
+      ]
+    },
+    "ml": {
+      "name": "Machine Learning",
+      "tabs": [
+        "https://pytorch.org/tutorials/",
+        "https://www.tensorflow.org/tutorials",
+        "https://scikit-learn.org/stable/tutorial/index.html",
+        "https://huggingface.co/docs",
+        "https://keras.io/guides/",
+        "https://paperswithcode.com/"
+      ]
+    },
+    "web": {
+      "name": "Web Development",
+      "tabs": [
+        "https://developer.mozilla.org/en-US/docs/Learn",
+        "https://reactjs.org/docs/getting-started.html",
+        "https://nodejs.org/en/docs/",
+        "https://vuejs.org/guide/introduction.html",
+        "https://angular.io/docs",
+        "https://nextjs.org/docs"
+      ]
+    },
+    "news": {
+      "name": "Tech News",
+      "tabs": [
+        "https://news.ycombinator.com/",
+        "https://techcrunch.com/",
+        "https://arstechnica.com/",
+        "https://www.theverge.com/",
+        "https://www.wired.com/",
+        "https://slashdot.org/"
+      ]
+    }
+  }
+}

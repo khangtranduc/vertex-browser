@@ -4,7 +4,7 @@ import json
 from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect, QEvent
 from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon, QFontMetrics
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
-                             QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
+                             QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel, QCheckBox)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 import math
 import random
@@ -12,6 +12,7 @@ from anthropic import Anthropic
 import concurrent.futures
 import threading
 from cluster_summarizer import ClusterSummarizer
+from spanning_tree import SpanningTreeCalculator, Edge
 
 class GraphView(QWidget):
     """Widget that displays a graph visualization of browser tabs"""
@@ -63,6 +64,11 @@ class GraphView(QWidget):
         except Exception:
             pass
         self.pinch_center = None
+
+        # MST visualization
+        self.show_mst_only = True  # Default to MST-only view
+        self.mst_result = None
+        self.mst_calculator = SpanningTreeCalculator(min_edge_weight=0.2)
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -132,13 +138,28 @@ class GraphView(QWidget):
         # Track hovered node for drawing full title on top later
         hovered_node_data = None
 
+        # Identify most central nodes per cluster from MST
+        central_nodes = set()
+        if self.mst_result and self.cluster_map:
+            cluster_central = self.mst_calculator.get_cluster_central_nodes(
+                self.mst_result,
+                self.cluster_map,
+                top_n_per_cluster=1  # Just the most central node per cluster
+            )
+            for cluster_id, nodes_scores in cluster_central.items():
+                if nodes_scores:
+                    central_nodes.add(nodes_scores[0][0])  # Add the top node
+
         for idx, (x, y) in self.node_positions.items():
             tab_data = tabs[idx]
+
+            # Check if this is a central node
+            is_central = idx in central_nodes
 
             # Node appearance based on state
             if idx == self.hovered_node:
                 # Slightly smaller hovered radius while still fitting the title
-                radius = 75; 
+                radius = 75;
                 # Clean blue gradient (hovered) - Chrome-like
                 gradient = QRadialGradient(x, y, radius)
                 gradient.setColorAt(0, QColor(100, 160, 255))
@@ -148,8 +169,12 @@ class GraphView(QWidget):
                 border_color = QColor(66, 133, 244)
                 border_width = 2.5
             else:
-                # Slightly smaller normal radius so inline text still fits
-                radius = 70; 
+                # Make central nodes larger
+                if is_central:
+                    radius = 85  # Larger for central nodes
+                else:
+                    radius = 70  # Normal size
+
                 # Color by cluster if available
                 cluster_id = self.cluster_map.get(idx, None)
                 if cluster_id is not None:
@@ -162,12 +187,25 @@ class GraphView(QWidget):
 
                 # Subtle radial gradient tinted by cluster color
                 gradient = QRadialGradient(x, y, radius)
-                gradient.setColorAt(0, base_color.lighter(120))
-                gradient.setColorAt(0.8, base_color.lighter(105))
-                gradient.setColorAt(1, base_color.darker(110))
+                if is_central:
+                    # More vibrant gradient for central nodes
+                    gradient.setColorAt(0, base_color.lighter(130))
+                    gradient.setColorAt(0.6, base_color.lighter(110))
+                    gradient.setColorAt(1, base_color.darker(105))
+                else:
+                    gradient.setColorAt(0, base_color.lighter(120))
+                    gradient.setColorAt(0.8, base_color.lighter(105))
+                    gradient.setColorAt(1, base_color.darker(110))
+
                 node_brush = QBrush(gradient)
-                border_color = base_color.darker(120)
-                border_width = 2
+
+                # Thicker border for central nodes
+                if is_central:
+                    border_color = base_color.darker(140)
+                    border_width = 3.5
+                else:
+                    border_color = base_color.darker(120)
+                    border_width = 2
 
             # Soft shadow (not glow)
             painter.setBrush(QBrush(QColor(0, 0, 0, 20)))
@@ -458,85 +496,116 @@ class GraphView(QWidget):
         return None
 
     def draw_edges(self, painter, tabs, tab_indices, threshold=0.20):
-        """Draw edges between nodes when similarity exceeds threshold.
+        """Draw edges between nodes - either all edges or MST only.
 
         painter: QPainter already transformed for pan/zoom
         tabs: dict mapping tab index -> {'title', 'url', 'widget'}
         tab_indices: list of tab indices in display order
-        threshold: similarity cutoff (0..1)
+        threshold: similarity cutoff (0..1) - used only if not showing MST
         """
         if not tab_indices or len(tab_indices) < 2:
             return
 
-        for i, idx1 in enumerate(tab_indices):
-            for idx2 in tab_indices[i+1:]:
-                try:
-                    similarity = self.browser.calculate_similarity(
-                        tabs[idx1]['url'], tabs[idx2]['url']
-                    )
-                except Exception as e:
-                    print(f"[DEBUG] Error calculating similarity: {e}")
-                    similarity = 0.0
+        # Calculate MST if needed and MST mode is enabled
+        if self.show_mst_only:
+            # Build edge list for MST calculation
+            edges = []
+            for i, idx1 in enumerate(tab_indices):
+                for idx2 in tab_indices[i+1:]:
+                    try:
+                        similarity = self.browser.calculate_similarity(
+                            tabs[idx1]['url'], tabs[idx2]['url']
+                        )
+                        if similarity > 0.0:  # Include all non-zero edges for MST
+                            edges.append(Edge(idx1, idx2, similarity))
+                    except Exception:
+                        pass
 
-                # Draw edge if similarity exceeds threshold
-                if similarity > threshold:
-                    x1, y1 = self.node_positions[idx1]
-                    x2, y2 = self.node_positions[idx2]
+            # Calculate MST with hybrid approach
+            if edges:
+                self.mst_result = self.mst_calculator.calculate_mst(
+                    nodes=tab_indices,
+                    edges=edges,
+                    clusters=self.cluster_map if self.cluster_map else None
+                )
 
-                    # Weight derived from similarity (0..1)
-                    weight = float(similarity)
+                # Draw only MST edges
+                for edge in self.mst_result.edges:
+                    self._draw_edge(painter, edge.node1, edge.node2, edge.weight)
+            else:
+                self.mst_result = None
+        else:
+            # Draw all edges above threshold (original behavior)
+            for i, idx1 in enumerate(tab_indices):
+                for idx2 in tab_indices[i+1:]:
+                    try:
+                        similarity = self.browser.calculate_similarity(
+                            tabs[idx1]['url'], tabs[idx2]['url']
+                        )
+                    except Exception as e:
+                        print(f"[DEBUG] Error calculating similarity: {e}")
+                        similarity = 0.0
 
-                    # Smoother thickness scaling - less variation
-                    min_width = 1.5
-                    max_width = 4
-                    thickness = min_width + (max_width - min_width) * weight
+                    # Draw edge if similarity exceeds threshold
+                    if similarity > threshold:
+                        self._draw_edge(painter, idx1, idx2, similarity)
 
-                    # More subtle alpha for less clutter
-                    alpha = int(60 + weight * 100)  # 60-160 range
+    def _draw_edge(self, painter, idx1, idx2, weight):
+        """Draw a single edge between two nodes"""
+        x1, y1 = self.node_positions[idx1]
+        x2, y2 = self.node_positions[idx2]
 
-                    # Modern browser-inspired blue colors
-                    if self.hovered_node in (idx1, idx2):
-                        # Bright blue when hovered (Chrome blue)
-                        color = QColor(66, 133, 244, alpha + 60)
-                    else:
-                        # Subtle gray-blue for normal edges
-                        color = QColor(128, 134, 139, alpha)
+        # Smoother thickness scaling - less variation
+        min_width = 1.5
+        max_width = 4
+        thickness = min_width + (max_width - min_width) * weight
 
-                    # Create curved path instead of straight line
-                    path = QPainterPath()
-                    path.moveTo(x1, y1)
+        # More subtle alpha for less clutter
+        alpha = int(60 + weight * 100)  # 60-160 range
 
-                    # Calculate control point for bezier curve
-                    # Offset perpendicular to the line for a gentle curve
-                    mid_x = (x1 + x2) / 2
-                    mid_y = (y1 + y2) / 2
-                    dx = x2 - x1
-                    dy = y2 - y1
-                    dist = math.sqrt(dx*dx + dy*dy)
+        # Modern browser-inspired blue colors
+        if self.hovered_node in (idx1, idx2):
+            # Bright blue when hovered (Chrome blue)
+            color = QColor(66, 133, 244, alpha + 60)
+        else:
+            # Subtle gray-blue for normal edges
+            color = QColor(128, 134, 139, alpha)
 
-                    # Curve amount based on distance (less curve for short distances)
-                    curve_amount = min(50, dist * 0.15)
+        # Create curved path instead of straight line
+        path = QPainterPath()
+        path.moveTo(x1, y1)
 
-                    # Perpendicular offset
-                    if dist > 0:
-                        ctrl_x = mid_x - dy / dist * curve_amount
-                        ctrl_y = mid_y + dx / dist * curve_amount
-                    else:
-                        ctrl_x = mid_x
-                        ctrl_y = mid_y
+        # Calculate control point for bezier curve
+        # Offset perpendicular to the line for a gentle curve
+        mid_x = (x1 + x2) / 2
+        mid_y = (y1 + y2) / 2
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = math.sqrt(dx*dx + dy*dy)
 
-                    # Draw smooth quadratic bezier curve
-                    path.quadTo(ctrl_x, ctrl_y, x2, y2)
+        # Curve amount based on distance (less curve for short distances)
+        curve_amount = min(50, dist * 0.15)
 
-                    pen = QPen(color, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-                    painter.setPen(pen)
-                    painter.drawPath(path)
+        # Perpendicular offset
+        if dist > 0:
+            ctrl_x = mid_x - dy / dist * curve_amount
+            ctrl_y = mid_y + dx / dist * curve_amount
+        else:
+            ctrl_x = mid_x
+            ctrl_y = mid_y
 
-                    # Only show similarity score on hover
-                    if self.hovered_node in (idx1, idx2):
-                        painter.setFont(QFont('SF Pro Display', 9, QFont.Bold))
-                        painter.setPen(QPen(QColor(66, 133, 244)))
-                        painter.drawText(int(mid_x), int(mid_y - 5), f"{similarity:.2f}")
+        # Draw smooth quadratic bezier curve
+        path.quadTo(ctrl_x, ctrl_y, x2, y2)
+
+        pen = QPen(color, thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+        # Only show similarity score on hover
+        if self.hovered_node in (idx1, idx2):
+            painter.setFont(QFont('SF Pro Display', 9, QFont.Bold))
+            painter.setPen(QPen(QColor(66, 133, 244)))
+            painter.drawText(int(mid_x), int(mid_y - 5), f"{weight:.2f}")
 
     def compute_clusters(self, tabs, tab_indices, threshold=None):
         """Compute clusters as connected components where edge weight >= threshold.
@@ -1545,11 +1614,82 @@ class Browser(QMainWindow):
         if idx == self.graph_tab_index:
             self.update_graph()
 
+    def load_test_tabs(self, preset='default'):
+        """Load a predefined set of tabs for testing and demonstration
+
+        Args:
+            preset: Name of preset to load from test_tabs.json (default: 'default')
+                   Can also pass a list of URLs directly
+        """
+        # Allow passing URLs directly
+        if isinstance(preset, list):
+            test_urls = preset
+            preset_name = "Custom"
+        else:
+            # Try to load from JSON config file
+            config_file = os.path.join(os.path.dirname(__file__), 'test_tabs.json')
+
+            if os.path.exists(config_file):
+                try:
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+
+                    if preset in config.get('presets', {}):
+                        preset_data = config['presets'][preset]
+                        test_urls = preset_data['tabs']
+                        preset_name = preset_data.get('name', preset)
+                    else:
+                        print(f"⚠ Preset '{preset}' not found in test_tabs.json")
+                        print(f"Available presets: {', '.join(config.get('presets', {}).keys())}")
+                        return
+                except Exception as e:
+                    print(f"⚠ Error loading test_tabs.json: {e}")
+                    return
+            else:
+                # Fallback to hardcoded default
+                test_urls = [
+                    "https://docs.python.org/3/tutorial/",
+                    "https://realpython.com/python-basics/",
+                    "https://pytorch.org/tutorials/",
+                    "https://www.tensorflow.org/tutorials",
+                    "https://developer.mozilla.org/en-US/docs/Learn",
+                    "https://reactjs.org/docs/getting-started.html",
+                ]
+                preset_name = "Default (Hardcoded)"
+
+        print("\n" + "="*60)
+        print(f"🧪 Loading test tabs: {preset_name}")
+        print("="*60)
+
+        for url in test_urls:
+            print(f"  📄 Loading: {url}")
+            self.add_new_tab(url)
+
+        print(f"\n✓ Loaded {len(test_urls)} test tabs")
+        print("  Switch to 'Graph View' to see the clusters!")
+        print("  Wait for pages to load, then click '⟳ Extract Content'")
+        print("="*60)
+
 
 def main():
     app = QApplication(sys.argv)
     browser = Browser()
     browser.show()
+
+    # Check for --test or --demo flag to load preset tabs
+    if '--test' in sys.argv or '--demo' in sys.argv:
+        # Check if a preset name is specified
+        preset = 'default'
+        for i, arg in enumerate(sys.argv):
+            if arg in ['--test', '--demo'] and i + 1 < len(sys.argv):
+                # Next argument might be the preset name
+                next_arg = sys.argv[i + 1]
+                if not next_arg.startswith('--'):
+                    preset = next_arg
+                    break
+
+        browser.load_test_tabs(preset)
+
     sys.exit(app.exec_())
 
 

@@ -1128,6 +1128,8 @@ class BrowserTab(QWidget):
             # Trigger graph update after content is extracted
             if hasattr(self, 'browser_parent') and self.browser_parent:
                 self.browser_parent.update_graph()
+                # Pre-calculate similarities in background
+                self.browser_parent.precalculate_similarities()
 
         self.web_view.page().runJavaScript(js_code, handle_content)
 
@@ -1799,7 +1801,43 @@ class Browser(QMainWindow):
     def update_graph(self):
         """Update the graph view"""
         self.graph_view.update()
-    
+
+    def precalculate_similarities(self):
+        """Pre-calculate all similarities in background to populate cache"""
+        if not self.anthropic_client:
+            return  # No API, can't precalculate
+
+        tabs = self.get_web_tabs()
+        tab_indices = list(tabs.keys())
+
+        if len(tab_indices) < 2:
+            return
+
+        # Submit background jobs to calculate all pairwise similarities
+        def calculate_pair(idx1, idx2):
+            try:
+                url1 = tabs[idx1]['url']
+                url2 = tabs[idx2]['url']
+                # This will cache the result
+                self.calculate_similarity(url1, url2)
+            except Exception as e:
+                print(f"⚠ Background similarity calculation error: {e}")
+
+        # Use existing thread pool executor to calculate similarities
+        for i, idx1 in enumerate(tab_indices):
+            for idx2 in tab_indices[i+1:]:
+                # Check if already cached
+                url1 = tabs[idx1]['url']
+                url2 = tabs[idx2]['url']
+                cache_key = f"{min(url1, url2)}||{max(url1, url2)}"
+
+                if cache_key not in self.similarity_cache:
+                    # Submit background calculation
+                    try:
+                        self._summary_executor.submit(calculate_pair, idx1, idx2)
+                    except Exception:
+                        pass  # Executor might be full, that's OK
+
     def on_tab_changed(self, idx):
         """Handle tab changes"""
         if idx == self.graph_tab_index:

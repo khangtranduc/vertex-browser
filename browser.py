@@ -2,7 +2,7 @@ import sys
 import os
 import json
 from PyQt5.QtCore import QUrl, Qt, QPointF, QTimer, QSize, QRect, QEvent
-from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon
+from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QBrush, QRadialGradient, QPainterPath, QPixmap, QIcon, QFontMetrics
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QWidget, QLineEdit, QPushButton, QLabel)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -137,7 +137,7 @@ class GraphView(QWidget):
 
             # Node appearance based on state
             if idx == self.hovered_node:
-                radius = 75
+                radius = 88
                 # Clean blue gradient (hovered) - Chrome-like
                 gradient = QRadialGradient(x, y, radius)
                 gradient.setColorAt(0, QColor(100, 160, 255))
@@ -147,7 +147,7 @@ class GraphView(QWidget):
                 border_color = QColor(66, 133, 244)
                 border_width = 2.5
             else:
-                radius = 70
+                radius = 80
                 # Color by cluster if available
                 cluster_id = self.cluster_map.get(idx, None)
                 if cluster_id is not None:
@@ -177,29 +177,47 @@ class GraphView(QWidget):
             painter.setPen(QPen(border_color, border_width))
             painter.drawEllipse(QPointF(x, y), radius, radius)
 
-            # Draw favicon in center of node (shift up a bit to leave room for title)
+            # Draw favicon in center of node (shift up a bit to leave room for label)
             if 'icon' in tab_data and not tab_data['icon'].isNull():
-                icon_size = 40 if idx == self.hovered_node else 36
+                icon_size = 48 if idx == self.hovered_node else 44
                 pixmap = tab_data['icon'].pixmap(QSize(icon_size, icon_size))
                 painter.drawPixmap(
                     int(x - icon_size / 2),
-                    int(y - icon_size / 2 - 12),  # Move up to make room for title below
+                    int(y - icon_size / 2 - 14),  # Move up to make room for label below
                     pixmap
                 )
 
-            # Tab title - draw inside the node below the icon (truncated when not hovered)
-            painter.setFont(QFont('SF Pro Display', 14, QFont.Normal))
-            full_title = tab_data['title']
-            if idx != self.hovered_node:
-                title = full_title[:15] + '...' if len(full_title) > 15 else full_title
-                # Normal constrained space when not hovering
-                text_rect = painter.boundingRect(0, 0, radius * 2 - 20, 60, Qt.AlignCenter | Qt.TextWordWrap, title)
-                text_rect.moveCenter(QPointF(x, y + 25).toPoint())
-                # Dark gray text for better contrast
-                painter.setPen(QPen(QColor(60, 64, 67)))
-                painter.drawText(text_rect, Qt.AlignCenter | Qt.TextWordWrap, title)
-            else:
-                # Save hovered node data to render full title on top later
+            # Small truncated label inside the node
+            try:
+                label = tab_data.get('title', '')
+                # Prefer web view's title if available (full title fetched for hover)
+                widget = tab_data.get('widget')
+                if widget is not None and hasattr(widget, 'web_view'):
+                    wtitle = widget.web_view.title()
+                    if wtitle:
+                        label = wtitle
+            except Exception:
+                label = tab_data.get('title', '')
+
+            # Truncate to a short inline label (12 chars) for compact display
+            short_label = label[:12] + '…' if len(label) > 12 else label
+            painter.setFont(QFont('SF Pro Display', 9, QFont.Normal))
+            painter.setPen(QPen(QColor(60, 64, 67)))
+            txt_rect = painter.boundingRect(0, 0, int(radius * 1.5), 18, Qt.AlignCenter, short_label)
+            txt_rect.moveCenter(QPointF(x, y + radius * 0.45).toPoint())
+            painter.drawText(txt_rect, Qt.AlignCenter, short_label)
+
+            # Save full title from web view (for hover overlay)
+            full_title = tab_data.get('title', '')
+            try:
+                if widget is not None and hasattr(widget, 'web_view'):
+                    wtitle = widget.web_view.title()
+                    if wtitle:
+                        full_title = wtitle
+            except Exception:
+                pass
+
+            if idx == self.hovered_node:
                 hovered_node_data = {
                     'x': x,
                     'y': y,
@@ -209,18 +227,23 @@ class GraphView(QWidget):
 
             # Draw close button when hovered
             if idx == self.hovered_node:
-                close_btn_x = x + radius - 10
-                close_btn_y = y - radius + 10
-                close_btn_radius = 8
+                # Place the close button slightly outside the node at the top-right
+                # so it visually sits just outside the circle with a small overlap.
+                # Using an offset factor that, when applied to both axes, positions
+                # the center ~5-8% outside the node radius along the diagonal.
+                close_btn_offset_factor = 0.75
+                close_btn_x = x + radius * close_btn_offset_factor
+                close_btn_y = y - radius * close_btn_offset_factor
+                close_btn_radius = 9
 
                 # Close button background
                 painter.setBrush(QBrush(QColor(220, 53, 69)))
                 painter.setPen(QPen(QColor(200, 40, 55), 1))
                 painter.drawEllipse(QPointF(close_btn_x, close_btn_y), close_btn_radius, close_btn_radius)
 
-                # X symbol
+                # X symbol (centered in the close button)
                 painter.setPen(QPen(QColor(255, 255, 255), 2))
-                offset = 4
+                offset = max(3, int(close_btn_radius * 0.45))
                 painter.drawLine(
                     int(close_btn_x - offset), int(close_btn_y - offset),
                     int(close_btn_x + offset), int(close_btn_y + offset)
@@ -253,72 +276,87 @@ class GraphView(QWidget):
                 painter.setPen(QPen(QColor(240, 245, 250)))
                 painter.drawText(tooltip_rect, Qt.AlignCenter, url)
 
-        # Draw hovered node's full title on top of everything (inside transformed coordinates)
+        # Hover overlay will be drawn in screen coordinates after restore
+
+        # Restore painter state (end of transformed drawing)
+        painter.restore()
+
+        # Draw hovered node's full title in screen coordinates so sizing
+        # and wrapping are measured against widget pixels (avoids issues
+        # when zoom/pan transforms are active).
         if hovered_node_data:
             from PyQt5.QtCore import QRectF
             from PyQt5.QtGui import QTextDocument
 
-            x = hovered_node_data['x']
-            y = hovered_node_data['y']
+            # Convert graph coordinates to screen coordinates (apply zoom & pan)
+            gx = hovered_node_data['x']
+            gy = hovered_node_data['y']
             radius = hovered_node_data['radius']
             full_title = hovered_node_data['title']
 
+            sx = gx * self.zoom + self.offset_x
+            sy = gy * self.zoom + self.offset_y
+
             font = QFont('SF Pro Display', 14, QFont.Bold)
-            painter.setFont(font)
 
             # Use QTextDocument for proper text layout with word wrapping
-            max_width = 400
+            max_chars = 200
+            display_title = full_title if len(full_title) <= max_chars else full_title[:max_chars] + "…"
+
             doc = QTextDocument()
             doc.setDefaultFont(font)
-
-            # Set HTML with color styling to ensure text is visible
-            html_text = f'<div style="color: rgb(60, 64, 67); text-align: center;">{full_title}</div>'
+            html_text = f'<div style="color: rgb(60, 64, 67); text-align: center;">{display_title}</div>'
             doc.setHtml(html_text)
 
-            # First measure without width constraint to get natural width
-            doc.setTextWidth(-1)  # No width constraint
-            natural_size = doc.size()
-            natural_width = natural_size.width()
+            # Measure natural width (no constraint) using font metrics for accuracy
+            fm = QFontMetrics(font)
+            natural_width = fm.horizontalAdvance(display_title)
 
-            # If natural width exceeds max, constrain and allow wrapping
-            if natural_width > max_width:
-                doc.setTextWidth(max_width)
+            # Safe maximum (60% of widget width, cap at 800px)
+            safe_max = min(800, int(self.width() * 0.6))
+
+            if natural_width > safe_max:
+                # Constrain document to safe_max so it wraps
+                doc.setTextWidth(safe_max)
                 text_size = doc.size()
                 text_width = text_size.width()
                 text_height = text_size.height()
             else:
-                # Use natural width (no wrapping needed)
-                text_width = natural_width
-                text_height = natural_size.height()
+                # Use measured natural width; set doc width to that to get height
+                doc.setTextWidth(natural_width)
+                text_size = doc.size()
+                text_width = text_size.width()
+                text_height = text_size.height()
 
-            # Create rect for the text, centered below the node
+            # Position the popup centered below the node in screen coords
             text_rect = QRectF(
-                x - text_width / 2,
-                y + 25 - text_height / 2,
+                sx - text_width / 2,
+                sy + radius + 12,
                 text_width,
                 text_height
             )
 
-            # Draw white background box for full title with shadow
-            # Draw shadow first
+            # Ensure popup stays within widget bounds horizontally
+            if text_rect.left() < 8:
+                text_rect.moveLeft(8)
+            if text_rect.right() > self.width() - 8:
+                text_rect.moveRight(self.width() - 8)
+
+            # Draw shadow + background + border
             painter.setBrush(QBrush(QColor(0, 0, 0, 40)))
             painter.setPen(QPen(Qt.NoPen))
             painter.drawRoundedRect(text_rect.adjusted(-8, -3, 14, 9), 8, 8)
 
-            # Draw white background box for full title
             painter.setBrush(QBrush(QColor(255, 255, 255, 250)))
             painter.setPen(QPen(QColor(66, 133, 244), 2))
             painter.drawRoundedRect(text_rect.adjusted(-10, -5, 10, 5), 8, 8)
 
-            # Draw full title text using the document
+            # Draw the text
             painter.setPen(QPen(QColor(60, 64, 67)))
             painter.save()
             painter.translate(text_rect.topLeft())
             doc.drawContents(painter)
             painter.restore()
-
-        # Restore painter state
-        painter.restore()
         # Draw overlay panel for selected cluster (no transform)
         if self.selected_cluster is not None:
             panel_width = min(360, max(260, int(self.width() * 0.28)))
@@ -408,7 +446,7 @@ class GraphView(QWidget):
         
         for idx, (x, y) in self.node_positions.items():
             distance = math.sqrt((graph_x - x)**2 + (graph_y - y)**2)
-            if distance <= 75:  # Max node radius (updated for larger nodes)
+            if distance <= 92:  # Max node radius (updated for larger nodes)
                 return idx
         return None
 

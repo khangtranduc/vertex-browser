@@ -140,10 +140,19 @@ class GraphView(QWidget):
         central_nodes = set()
         if self.mst_result and self.cluster_map:
             cluster_central = self.mst_calculator.get_cluster_central_nodes(
-                self.mst_result, self.cluster_map, top_n_per_cluster=1
+                self.mst_result, self.cluster_map, top_n_per_cluster=10  # Get all nodes
             )
             for cluster_id, nodes_scores in cluster_central.items():
-                if nodes_scores:
+                if not nodes_scores or len(nodes_scores) < 2:
+                    continue
+                # Only highlight as central if there's a clear difference in centrality
+                # Check if top node has significantly higher score than second node
+                top_score = nodes_scores[0][1]
+                second_score = nodes_scores[1][1] if len(nodes_scores) > 1 else 0.0
+
+                # Only highlight if the top score is at least 2% higher than second
+                # This avoids highlighting in cases where all nodes are equal
+                if top_score > second_score * 1.02:
                     central_nodes.add(nodes_scores[0][0])
 
         # Track hovered node for drawing full title on top later
@@ -513,10 +522,17 @@ class GraphView(QWidget):
                     if similarity > threshold:
                         edges.append(Edge(idx1, idx2, similarity))
 
-            # Calculate MST
+            # Calculate MST (but use full graph for centrality)
             self.mst_result = self.mst_calculator.calculate_mst(
                 tab_indices, edges, self.cluster_map
             )
+
+            # Calculate centrality based on full graph, not just MST
+            full_graph_centrality = self.mst_calculator._calculate_centrality(
+                tab_indices, edges  # Use ALL edges, not just MST
+            )
+            # Override the MST-based centrality with full graph centrality
+            self.mst_result.node_centrality = full_graph_centrality
 
             # Draw only MST edges
             for edge in self.mst_result.edges:
